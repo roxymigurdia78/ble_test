@@ -25,6 +25,8 @@
 #define RETRY_DELAY_SEC 5           
 #define MAX_ATTEMPTS 2              
 
+#define KEY_LIST_FILE "parent_key_list.txt"
+
 int dev_id;
 int sock;
 int my_key;
@@ -108,6 +110,74 @@ void extract_parent_tag_from_name(const char *name, char *out_parent, size_t out
         out_parent[i++] = *p++;
     }
     out_parent[i] = '\0';
+}
+
+// ==================================================
+// 親になったノード用: key & addr を昇順でファイル保存
+// 形式: 「key addr」を1行に1組
+// ==================================================
+void save_key_list(const char *filename) {
+    FILE *fp = fopen(filename, "w");
+    if (!fp) {
+        perror("save_key_list: fopen");
+        return;
+    }
+
+    typedef struct {
+        int  key;
+        char addr[18];
+    } KeyEntry;
+
+    KeyEntry list[MAX_DEVS + 1];
+    int count = 0;
+
+    // 自分自身
+    strncpy(list[count].addr, my_addr, sizeof(list[count].addr));
+    list[count].addr[sizeof(list[count].addr) - 1] = '\0';
+    list[count].key = my_key;
+    count++;
+
+    // 検出した他ノード
+    pthread_mutex_lock(&detected_mutex);
+    for (int i = 0; i < detected_count && count < MAX_DEVS + 1; i++) {
+        if (strcmp(detected_devices[i].addr, my_addr) == 0) {
+            continue; // 自分が混ざっていたらスキップ
+        }
+        // 重複チェック
+        int dup = 0;
+        for (int j = 0; j < count; j++) {
+            if (strcmp(list[j].addr, detected_devices[i].addr) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup) continue;
+
+        strncpy(list[count].addr, detected_devices[i].addr, sizeof(list[count].addr));
+        list[count].addr[sizeof(list[count].addr) - 1] = '\0';
+        list[count].key = detected_devices[i].key;
+        count++;
+    }
+    pthread_mutex_unlock(&detected_mutex);
+
+    // key 昇順ソート
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (list[j].key < list[i].key) {
+                KeyEntry tmp = list[i];
+                list[i] = list[j];
+                list[j] = tmp;
+            }
+        }
+    }
+
+    // ファイル出力
+    for (int i = 0; i < count; i++) {
+        fprintf(fp, "%d %s\n", list[i].key, list[i].addr);
+    }
+
+    fclose(fp);
+    printf("Saved %d entries to %s\n", count, filename);
 }
 
 // =========================
@@ -549,6 +619,9 @@ int main(int argc, char *argv[]) {
             if (strcmp(final_parent_addr_full, my_addr) == 0) {
                 printf("I am PARENT — executing parent program.\n");
 
+                // 親になるノードだけ、キーリストを保存して parent に渡す
+                save_key_list(KEY_LIST_FILE);
+
                 char cmd[128];
                 snprintf(cmd, sizeof(cmd), "./parent %s", final_parent_addr_full);
                 printf("[DEBUG] Executing command: %s\n", cmd); 
@@ -569,7 +642,6 @@ int main(int argc, char *argv[]) {
                 printf("[DEBUG] Executing command: %s\n", cmd); 
                 system(cmd);   
             }
-
 
             break;
         } else {
