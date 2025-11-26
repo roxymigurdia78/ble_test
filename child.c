@@ -9,6 +9,8 @@
 #include <math.h>     
 #include <string.h>   
 #include <time.h>
+#include <errno.h>
+#include <pthread.h>
 
 #include <wiringPi.h>
 #include <wiringPiSPI.h>
@@ -23,6 +25,15 @@
 #define CHILD_ADDR_ARG  argv[1]
 #define PARENT_ADDR_ARG argv[2]
 
+// 自分のアドレス（スキャンスレッドから参照するためグローバルにコピー）
+static char g_my_addr[18] = "(unknown)";
+
+// 電磁石タイム要求フラグ (親機からの自分宛 MT を検知)
+static volatile int electromagnet_requested = 0;
+// 電磁石が駆動中フラグ (隣接キューブのセンサーはこの間のみ反応)
+static volatile int electromagnet_active = 0; 
+static pthread_mutex_t mag_state_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // ==========================================================
 // 🚨 BLE送信関数（アドバタイズを使って面情報を送る）
 // ==========================================================
@@ -30,8 +41,8 @@ int BLE_send_surface_data(const char *my_addr,
                           const char *parent_addr,
                           const char *surface_name)
 {
-    printf("\n[COMM] Attempting BLE ADV send: Child=%s, Parent=%s, Surface=%s\n",
-           my_addr, parent_addr, surface_name);
+    printf("\n[COMM] Attempting BLE ADV send: Child=%s, Surface=%s\n",
+           my_addr, surface_name);
 
     int dev_id = hci_get_route(NULL);
     if (dev_id < 0) {
@@ -126,6 +137,96 @@ int BLE_send_surface_data(const char *my_addr,
     }
 
     printf("[COMM] BLE advertising stopped.\n");
+
+    close(sock);
+    return 0;
+}
+
+// ==========================================================
+// 追加: 電磁石タイム終了を知らせる ADV ("ME") を10秒間送信
+// Local Name: "ME"
+// ==========================================================
+int BLE_send_mag_end(const char *my_addr) {
+    printf("[COMM] Sending MAG END advertise from %s\n", my_addr);
+
+    int dev_id = hci_get_route(NULL);
+    if (dev_id < 0) {
+        perror("[BLE] hci_get_route (ME)");
+        return -1;
+    }
+
+    int sock = hci_open_dev(dev_id);
+    if (sock < 0) {
+        perror("[BLE] hci_open_dev (ME)");
+        return -1;
+    }
+
+    le_set_advertising_parameters_cp adv_params_cp;
+    memset(&adv_params_cp, 0, sizeof(adv_params_cp));
+    uint16_t interval = (uint16_t)(500 * 1.6);
+    adv_params_cp.min_interval     = htobs(interval);
+    adv_params_cp.max_interval     = htobs(interval);
+    adv_params_cp.advtype          = 0x00;
+    adv_params_cp.own_bdaddr_type  = 0x00;
+    adv_params_cp.chan_map         = 0x07;
+    adv_params_cp.filter           = 0x00;
+
+    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_PARAMETERS,
+                     sizeof(adv_params_cp), &adv_params_cp) < 0) {
+        perror("[BLE] Failed to set advertising parameters (ME)");
+        close(sock);
+        return -1;
+    }
+
+    uint8_t adv_data[31];
+    memset(adv_data, 0, sizeof(adv_data));
+    int len = 0;
+
+    // Flags
+    adv_data[len++] = 2;
+    adv_data[len++] = 0x01;
+    adv_data[len++] = 0x06;
+
+    const char *name_field = "ME";
+    int name_len = (int)strlen(name_field);
+    adv_data[len++] = (uint8_t)(name_len + 1);
+    adv_data[len++] = 0x09; // Complete Local Name
+    memcpy(&adv_data[len], name_field, name_len);
+    len += name_len;
+
+    struct {
+        uint8_t length;
+        uint8_t data[31];
+    } __attribute__((packed)) adv_data_cp_struct;
+
+    adv_data_cp_struct.length = (uint8_t)len;
+    memset(adv_data_cp_struct.data, 0, sizeof(adv_data_cp_struct.data));
+    memcpy(adv_data_cp_struct.data, adv_data, len);
+
+    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_DATA,
+                     len + 1, &adv_data_cp_struct) < 0) {
+        perror("[BLE] Failed to set advertising data (ME)");
+        close(sock);
+        return -1;
+    }
+
+    uint8_t enable = 0x01;
+    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE,
+                     1, &enable) < 0) {
+        perror("[BLE] Failed to enable advertising (ME)");
+        close(sock);
+        return -1;
+    }
+
+    printf("[COMM] MAG END advertising start (10 seconds)\n");
+    sleep(10);
+
+    enable = 0x00;
+    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE,
+                     1, &enable) < 0) {
+        perror("[BLE] Failed to disable advertising (ME)");
+    }
+    printf("[COMM] MAG END advertising stop\n");
 
     close(sock);
     return 0;
@@ -268,6 +369,140 @@ double read_adc_voltage(int ch) {
 }
 
 // ---------------------------------------------------------
+// 子機側: 親の "MT:<自分のアドレス>" アドバタイズを監視するスレッド
+// ---------------------------------------------------------
+void *mag_scan_thread(void *arg) {
+    (void)arg;
+
+    int dev_id = hci_get_route(NULL);
+    if (dev_id < 0) {
+        perror("[SCAN] hci_get_route");
+        return NULL;
+    }
+
+    int sock = hci_open_dev(dev_id);
+    if (sock < 0) {
+        perror("[SCAN] hci_open_dev");
+        return NULL;
+    }
+
+    struct hci_filter nf;
+    hci_filter_clear(&nf);
+    hci_filter_set_ptype(HCI_EVENT_PKT, &nf);
+    hci_filter_set_event(EVT_LE_META_EVENT, &nf);
+    if (setsockopt(sock, SOL_HCI, HCI_FILTER, &nf, sizeof(nf)) < 0) {
+        perror("[SCAN] HCI filter");
+        close(sock);
+        return NULL;
+    }
+
+    le_set_scan_parameters_cp scan_params_cp;
+    memset(&scan_params_cp, 0, sizeof(scan_params_cp));
+    scan_params_cp.type = 0x01;               // Active scan
+    scan_params_cp.interval = htobs(0x0010);
+    scan_params_cp.window   = htobs(0x0010);
+    scan_params_cp.own_bdaddr_type = 0x00;    // Public
+    scan_params_cp.filter   = 0x00;
+
+    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_SCAN_PARAMETERS,
+                     sizeof(scan_params_cp), &scan_params_cp) < 0) {
+        perror("[SCAN] set scan params");
+        close(sock);
+        return NULL;
+    }
+
+    uint8_t enable = 0x01;
+    uint8_t filter_dup = 0x00;
+    uint8_t cmd[2] = { enable, filter_dup };
+    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE,
+                     sizeof(cmd), cmd) < 0) {
+        perror("[SCAN] enable scan");
+        close(sock);
+        return NULL;
+    }
+
+    unsigned char buf[HCI_MAX_EVENT_SIZE];
+
+    printf("[SCAN] 子機スキャンスレッド開始 (MT: 自分宛ての電磁石タイム要求を監視)\n");
+
+    while (1) {
+        int len = read(sock, buf, sizeof(buf));
+        if (len < 0) {
+            if (errno == EINTR) continue;
+            perror("[SCAN] read");
+            break;
+        }
+        if (len < (1 + HCI_EVENT_HDR_SIZE)) continue;
+
+        uint8_t *ptr = buf + (1 + HCI_EVENT_HDR_SIZE);
+        evt_le_meta_event *meta = (evt_le_meta_event *)ptr;
+        if (meta->subevent != EVT_LE_ADVERTISING_REPORT) continue;
+
+        uint8_t reports = meta->data[0];
+        uint8_t *offset = meta->data + 1;
+
+        for (int i = 0; i < reports; i++) {
+            le_advertising_info *info = (le_advertising_info *)offset;
+
+            char name[128] = "";
+            int pos = 0;
+            while (pos < info->length) {
+                uint8_t field_len = info->data[pos];
+                if (field_len == 0) break;
+                if (pos + field_len >= info->length) break;
+
+                uint8_t field_type = info->data[pos + 1];
+                if (field_type == 0x09 || field_type == 0x08) {
+                    int name_len = field_len - 1;
+                    if (name_len > (int)sizeof(name)-1)
+                        name_len = (int)sizeof(name)-1;
+                    memcpy(name, &info->data[pos + 2], name_len);
+                    name[name_len] = '\0';
+                }
+                pos += field_len + 1;
+            }
+
+            if (name[0] != '\0') {
+                // Local Name が "MT:<addr>" 形式かチェック
+                if (strncmp(name, "MT:", 3) == 0) {
+                    const char *addr_part = name + 3;
+                    if (strcmp(addr_part, g_my_addr) == 0) {
+                        pthread_mutex_lock(&mag_state_mutex);
+                        if (!electromagnet_requested) {
+                            electromagnet_requested = 1;
+                            printf("\n[MAG] 自分宛ての電磁石タイム要求(MT)を検知しました。\n");
+                            
+                            // ★ 要求を検知したらスキャンを停止し、スレッドを終了する
+                            enable = 0x00;
+                            cmd[0] = enable;
+                            cmd[1] = 0x00;
+                            hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE,
+                                         sizeof(cmd), cmd);
+                            close(sock);
+                            pthread_mutex_unlock(&mag_state_mutex);
+                            return NULL; // スレッド終了
+                        }
+                        pthread_mutex_unlock(&mag_state_mutex);
+                    }
+                }
+            }
+
+            offset = (uint8_t *)info + sizeof(*info) + info->length;
+        }
+    }
+
+    // 通常は到達しない
+    enable = 0x00;
+    cmd[0] = enable;
+    cmd[1] = 0x00;
+    hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE,
+                 sizeof(cmd), cmd);
+
+    close(sock);
+    return NULL;
+}
+
+// ---------------------------------------------------------
 // 子機のメイン関数
 // ---------------------------------------------------------
 int main(int argc, char *argv[])
@@ -279,6 +514,10 @@ int main(int argc, char *argv[])
     }
     const char *my_addr     = CHILD_ADDR_ARG;
     const char *parent_addr = PARENT_ADDR_ARG;
+    
+    // グローバルコピー（スキャンスレッドが使う）
+    strncpy(g_my_addr, my_addr, sizeof(g_my_addr));
+    g_my_addr[sizeof(g_my_addr) - 1] = '\0';
     
     printf("\n==================================\n");
     printf("🌱 CHILD PROGRAM STARTING\n");
@@ -320,6 +559,13 @@ int main(int argc, char *argv[])
     }
     printf("Baseline established.\n");
 
+    // 親の MT アドバタイズを監視するスレッド開始
+    pthread_t scan_th;
+    if (pthread_create(&scan_th, NULL, mag_scan_thread, NULL) != 0) {
+        perror("mag_scan_thread の生成に失敗しました");
+        // 生成失敗しても、電磁石タイム機能なしで動作を継続
+    }
+
     printf("Begin continuous monitoring...\n");
 
     static char last_surface[16] = "";
@@ -327,6 +573,53 @@ int main(int argc, char *argv[])
     
     while (1)
     {
+        // --- 電磁石タイム要求が来ていないかチェック ---
+        pthread_mutex_lock(&mag_state_mutex);
+        int mag_req = electromagnet_requested;
+        int mag_active = electromagnet_active;
+        if (mag_req) {
+            electromagnet_requested = 0; // 要求を消費
+            electromagnet_active = 1;    // 電磁石を駆動
+        }
+        pthread_mutex_unlock(&mag_state_mutex);
+
+        if (mag_req) {
+            // **電磁石タイム本体 (自分自身を駆動)**
+            printf("\n===== 電磁石タイム START (自分自身を駆動) =====\n");
+            
+            // ★ coil.c で駆動を開始し、child 側で10秒間待機する
+            printf("電磁石を駆動します (./coil start を実行)。\n");
+            // NOTE: coil.cが10秒で終了しない場合は、ここでブロッキングされる
+            // 確実な10秒駆動のため、coil.cがGPIO ON/OFFのみを行うと想定し、child側でsleepする
+            system("./coil start"); 
+            
+            printf("10秒間駆動を維持します。\n");
+            sleep(10); 
+
+            // 終了を親に通知 (10秒間 "ME" をアドバタイズ)
+            BLE_send_mag_end(my_addr);
+
+            // ★ coil.c を呼び出し、停止させる
+            printf("電磁石を停止します (./coil stop を実行)。\n");
+            system("./coil stop");
+            
+            pthread_mutex_lock(&mag_state_mutex);
+            electromagnet_active = 0; // 電磁石駆動終了
+            pthread_mutex_unlock(&mag_state_mutex);
+
+            printf("===== 電磁石タイム END (ME送信完了) =====\n");
+            // 連続送信防止用の sleep(2) をここで代用
+            sleep(2); 
+            continue;
+        }
+
+        // ここから先は従来のセンサー監視ロジック（電磁石駆動中はスキップ）
+        if (mag_active) {
+            // 電磁石駆動中/ME送信待機中はセンサーをポーリングしない
+            usleep(100000);
+            continue;
+        }
+
         double window[NUM_CH];
         for (int ch = 1; ch < NUM_CH; ch++) { // CH1からCH6までをループ
             window[ch] = read_adc_voltage(ch);
@@ -375,7 +668,6 @@ int main(int argc, char *argv[])
                     // 側面 (CH2, CH3, CH4, CH5) の処理
                     
                     // 1. Headingに基づいて回転セクションを決定
-                    // 北(0度)基準: 315.0f〜45.0f
                     int rotation_index = 0; 
                     
                     if (heading_north >= 45.0f  && heading_north < 135.0f) rotation_index = 1; // 東向き (90度回転)
