@@ -1,0 +1,41 @@
+import sys
+import RPi.GPIO as GPIO
+
+# --- 設定 ---
+PIN_BLUE  = 5
+PIN_GREEN = 6
+PIN_RED   = 13
+
+# GPIOセットアップ
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False) # すでに使われていても警告を出さない
+GPIO.setup(PIN_BLUE, GPIO.OUT)
+GPIO.setup(PIN_GREEN, GPIO.OUT)
+GPIO.setup(PIN_RED, GPIO.OUT)
+
+def set_color(color):
+    # 一旦全部消す
+    GPIO.output(PIN_BLUE, GPIO.LOW)
+    GPIO.output(PIN_GREEN, GPIO.LOW)
+    GPIO.output(PIN_RED, GPIO.LOW)
+
+    if color == "blue":
+        GPIO.output(PIN_BLUE, GPIO.HIGH)
+    elif color == "green":
+        GPIO.output(PIN_GREEN, GPIO.HIGH)
+    elif color == "red":
+        GPIO.output(PIN_RED, GPIO.HIGH)
+    elif color == "off":
+        pass # 全部消したまま
+    else:
+        pass
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        target_color = sys.argv[1]
+        set_color(target_color)
+    else:
+        print("Usage: python3 led_control.py [blue|green|red|off]")
+
+    # 注意: ここで GPIO.cleanup() をするとライトが消えてしまうので、
+    # あえて cleanup() せずに終了することで点灯状態を維持します。
