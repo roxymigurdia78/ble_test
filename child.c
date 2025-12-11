@@ -1,17 +1,21 @@
 // child.c
-#include <stdio.h>    
+// ★ 修正: ログ出力の削減 (`[EVENT CANDIDATE]`, BLE ADV詳細ログを削除)。
+//          センサー検知ロジックは毎回実行に戻す。
+
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <linux/i2c-dev.h>
-#include <math.h>     
-#include <string.h>   
+#include <math.h>
+#include <string.h>
 #include <time.h>
 #include <errno.h>
 #include <pthread.h>
-#include <sys/stat.h> // coil.c機能のために追加
+#include <sys/stat.h>
+#include <sys/time.h>
 
 #include <wiringPi.h>
 #include <wiringPiSPI.h>
@@ -26,24 +30,29 @@
 #define CHILD_ADDR_ARG  argv[1]
 #define PARENT_ADDR_ARG argv[2]
 
-// 自分のアドレス（スキャンスレッドから参照するためグローバルにコピー）
+#define CHILD_MAP_FILE_PATH "mapping.txt"
+
+// 自分のアドレス（スキャンスレッドから参照）
 static char g_my_addr[18] = "(unknown)";
 
-// 電磁石タイム要求フラグ (親機からの自分宛 MT を検知)
+// 電磁石タイム要求フラグ
 static volatile int electromagnet_requested = 0;
-// 電磁石が駆動中フラグ (隣接キューブのセンサーはこの間のみ反応)
-static volatile int electromagnet_active = 0; 
+static volatile int electromagnet_active    = 0;
 static pthread_mutex_t mag_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// ★★★ coil.c から統合したGPIO制御定義 ★★★
-const int BCM_GPIO_PIN = 20; // BCM 20 を使用 (物理ピン38番)
+// マッピング終了フラグ
+static volatile int map_end_received = 0;
+
+// フェーズ: 0=MT待ち, 1=MAP 配布受信
+static volatile int g_scan_phase = 0;
+
+// GPIO
+const int BCM_GPIO_PIN = 20;
 static int g_linux_gpio = -1;
 
 // ==========================================================
-// ★★★ GPIO 制御ヘルパー関数 (coil.cから統合) ★★★
+// GPIO 制御ヘルパー (変更なし)
 // ==========================================================
-
-// 通常の書き込み（エラーは表示）
 static int writeFile(const char *path, const char *value) {
     FILE *f = fopen(path, "w");
     if (!f) { perror(path); return -1; }
@@ -52,7 +61,6 @@ static int writeFile(const char *path, const char *value) {
     return 0;
 }
 
-// エラーを表示しない書き込み（unexport用）
 static int writeFileSilent(const char *path, const char *value) {
     FILE *f = fopen(path, "w");
     if (!f) { return -1; }
@@ -61,28 +69,29 @@ static int writeFileSilent(const char *path, const char *value) {
     return 0;
 }
 
-// ファイルから int を読み込む (gpiochip の base を読む用)
 static int readInt(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) { perror(path); return -1; }
     int v;
-    if (fscanf(f, "%d", &v) != 1) { fprintf(stderr, "failed to read int from %s\n", path); fclose(f); return -1; }
+    if (fscanf(f, "%d", &v) != 1) {
+        fprintf(stderr, "failed to read int from %s\n", path);
+        fclose(f);
+        return -1;
+    }
     fclose(f);
     return v;
 }
 
-// ファイルが存在するかどうか
 static int fileExists(const char *path) {
     struct stat st;
     return (stat(path, &st) == 0);
 }
 
-// ★ 電磁石 ON 処理: export → out 設定 → ON
 static int gpio_init_and_on(void) {
     char num_str[16];
     char path_dir[128];
     char path_val[128];
-    
+
     if (g_linux_gpio == -1) {
         fprintf(stderr, "ERROR: GPIO pin not initialized.\n");
         return -1;
@@ -92,24 +101,20 @@ static int gpio_init_and_on(void) {
     snprintf(path_dir, sizeof(path_dir), "/sys/class/gpio/gpio%d/direction", g_linux_gpio);
     snprintf(path_val, sizeof(path_val), "/sys/class/gpio/gpio%d/value", g_linux_gpio);
 
-    // 1. 確実に unexport を試みる (クリーンアップ)
     writeFileSilent("/sys/class/gpio/unexport", num_str);
-    usleep(100000); 
+    usleep(100000);
 
-    // 2. GPIO を export
     if (writeFile("/sys/class/gpio/export", num_str) < 0) {
          fprintf(stderr, "ERROR: Failed to export GPIO %d. (Need sudo?)\n", g_linux_gpio);
          return -1;
     }
-    usleep(100000); 
+    usleep(100000);
 
-    // 3. 方向を out に設定
     if (writeFile(path_dir, "out") < 0) {
         fprintf(stderr, "ERROR: Failed to set direction to 'out'.\n");
         return -1;
     }
 
-    // 4. ON にする
     if (writeFile(path_val, "1") < 0) {
         fprintf(stderr, "ERROR: Failed to write '1' to value.\n");
         return -1;
@@ -118,91 +123,81 @@ static int gpio_init_and_on(void) {
     return 0;
 }
 
-// ★ 電磁石 OFF 処理: OFF → unexport
 static void gpio_off_and_unexport(void) {
     char num_str[16];
     char path_val[128];
-    
+
     if (g_linux_gpio == -1) return;
 
     snprintf(num_str, sizeof(num_str), "%d", g_linux_gpio);
     snprintf(path_val, sizeof(path_val), "/sys/class/gpio/gpio%d/value", g_linux_gpio);
 
     if (fileExists(path_val)) {
-        // 1. OFF にする (エラーは無視)
         writeFileSilent(path_val, "0");
-        
-        // 2. unexport (エラーは無視)
         writeFileSilent("/sys/class/gpio/unexport", num_str);
         printf("[GPIO] 子機電磁石 OFF & Unexport (GPIO %d)\n", g_linux_gpio);
     }
 }
-// ==========================================================
-
 
 // ==========================================================
-// 🚨 BLE送信関数（アドバタイズを使って面情報を送る）
+// BLE送信ユーティリティ (ログ出力削減)
 // ==========================================================
-int BLE_send_surface_data(const char *my_addr,
-                          const char *parent_addr,
-                          const char *surface_name)
-{
-    (void)parent_addr; 
-
-    printf("\n[COMM] Attempting BLE ADV send: Child=%s, Surface=%s\n",
-           my_addr, surface_name);
-
-    int dev_id = hci_get_route(NULL);
-    if (dev_id < 0) {
-        perror("[BLE] hci_get_route");
-        return -1;
-    }
-
-    int sock = hci_open_dev(dev_id);
-    if (sock < 0) {
-        perror("[BLE] hci_open_dev");
-        return -1;
-    }
-
-    // --- Advertising Parameters 設定 ---
+// 短時間の広告を設定するヘルパー (変更なし)
+static int setup_adv_parameters(int sock, uint16_t interval_ms) {
     le_set_advertising_parameters_cp adv_params_cp;
     memset(&adv_params_cp, 0, sizeof(adv_params_cp));
-    // 500ms程度のインターバル
-    uint16_t interval = (uint16_t)(500 * 1.6); // 0.625ms単位
+    uint16_t interval = (uint16_t)(interval_ms * 1.6);
     adv_params_cp.min_interval     = htobs(interval);
     adv_params_cp.max_interval     = htobs(interval);
-    adv_params_cp.advtype          = 0x00;    // Connectable undirected
-    adv_params_cp.own_bdaddr_type  = 0x00;    // Public
+    adv_params_cp.advtype          = 0x00;
+    adv_params_cp.own_bdaddr_type  = 0x00;
     adv_params_cp.chan_map         = 0x07;
     adv_params_cp.filter           = 0x00;
 
     if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_PARAMETERS,
                      sizeof(adv_params_cp), &adv_params_cp) < 0) {
         perror("[BLE] Failed to set advertising parameters");
+        return -1;
+    }
+    return 0;
+}
+
+// Surface-reportを複数回ブロードキャスト (ログ削減)
+int BLE_send_surface_data(const char *my_addr,
+                          const char *parent_addr,
+                          const char *surface_name)
+{
+    (void)parent_addr;
+
+    // ★ ログ削減: 広告開始メッセージのみ残す
+    printf("[COMM] Attempting BLE ADV send: Surface=%s\n", surface_name);
+
+    int dev_id = hci_get_route(NULL);
+    if (dev_id < 0) { perror("[BLE] hci_get_route"); return -1; }
+    int sock = hci_open_dev(dev_id);
+    if (sock < 0) { perror("[BLE] hci_open_dev"); return -1; }
+
+    if (setup_adv_parameters(sock, 100) < 0) { // 100ms間隔で設定
         close(sock);
         return -1;
     }
 
-    // --- Advertising Data 構築 ---
     uint8_t adv_data[31];
     memset(adv_data, 0, sizeof(adv_data));
-
     int len = 0;
-    // Flags
-    adv_data[len++] = 2;      // 長さ
-    adv_data[len++] = 0x01;   // Flags
-    adv_data[len++] = 0x06;   // LE General Discoverable + BR/EDR not supported
+    adv_data[len++] = 2;
+    adv_data[len++] = 0x01;
+    adv_data[len++] = 0x06;
 
-    // Local Name: "CubeNode|SURFACE:XXXX"
     char name_field[31];
     snprintf(name_field, sizeof(name_field),
              "CubeNode|SURFACE:%s", surface_name);
 
     int name_len = (int)strlen(name_field);
-    if (name_len > 29) name_len = 29; // 31 - 2(Length,type) =29
+    if (name_len > 29) name_len = 29;
 
-    adv_data[len++] = (uint8_t)(name_len + 1); // 長さ(タイプ+データ)
-    adv_data[len++] = 0x09;                   // Complete Local Name
+    adv_data[len++] = (uint8_t)(name_len + 1);
+    adv_data[len++] = 0x09;
     memcpy(&adv_data[len], name_field, name_len);
     len += name_len;
 
@@ -222,156 +217,37 @@ int BLE_send_surface_data(const char *my_addr,
         return -1;
     }
 
-    // --- Advertising Enable ---
-    uint8_t enable = 0x01;
-    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE,
-                     1, &enable) < 0) {
-        perror("[BLE] Failed to enable advertising");
-        close(sock);
-        return -1;
+    // 広告を複数回送信 (100msごとに5回)
+    for (int i = 0; i < 5; i++) {
+        uint8_t enable = 0x01;
+        if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE,
+                         1, &enable) < 0) {
+            perror("[BLE] Failed to enable advertising");
+            close(sock);
+            return -1;
+        }
+        usleep(100000); // 100ms 広告
+        uint8_t disable = 0x00;
+        hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, 1, &disable);
+        usleep(50000); // 50ms 停止
     }
-
-    printf("[COMM] BLE advertising started with name='%s'\n", name_field);
-
-    // 少なくとも1秒程度は広告を飛ばす（親が拾う時間）
-    sleep(1);
-
-    // --- Advertising Disable ---
-    enable = 0x00;
-    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE,
-                     1, &enable) < 0) {
-        perror("[BLE] Failed to disable advertising");
-        // ここは致命的ではないので続行
-    }
-
-    printf("[COMM] BLE advertising stopped.\n");
-
+    
+    // ★ ログ削減: 広告停止メッセージを削除
     close(sock);
     return 0;
 }
 
-// ==========================================================
-// 電磁石タイム終了を知らせる ADV ("ME") を20秒間送信 (ON時間に合わせる)
-// Local Name: "ME"
-// ==========================================================
-int BLE_send_mag_end(const char *my_addr) {
-    printf("[COMM] Sending MAG END advertise from %s\n", my_addr);
-
-    int dev_id = hci_get_route(NULL);
-    if (dev_id < 0) {
-        perror("[BLE] hci_get_route (ME)");
-        return -1;
-    }
-
-    int sock = hci_open_dev(dev_id);
-    if (sock < 0) {
-        perror("[BLE] hci_open_dev (ME)");
-        return -1;
-    }
-
-    le_set_advertising_parameters_cp adv_params_cp;
-    memset(&adv_params_cp, 0, sizeof(adv_params_cp));
-    uint16_t interval = (uint16_t)(500 * 1.6);
-    adv_params_cp.min_interval     = htobs(interval);
-    adv_params_cp.max_interval     = htobs(interval);
-    adv_params_cp.advtype          = 0x00;
-    adv_params_cp.own_bdaddr_type  = 0x00;
-    adv_params_cp.chan_map         = 0x07;
-    adv_params_cp.filter           = 0x00;
-
-    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_PARAMETERS,
-                     sizeof(adv_params_cp), &adv_params_cp) < 0) {
-        perror("[BLE] Failed to set advertising parameters (ME)");
-        close(sock);
-        return -1;
-    }
-
-    uint8_t adv_data[31];
-    memset(adv_data, 0, sizeof(adv_data));
-    int len = 0;
-
-    // Flags
-    adv_data[len++] = 2;
-    adv_data[len++] = 0x01;
-    adv_data[len++] = 0x06;
-
-    const char *name_field = "ME";
-    int name_len = (int)strlen(name_field);
-    adv_data[len++] = (uint8_t)(name_len + 1);
-    adv_data[len++] = 0x09; // Complete Local Name
-    memcpy(&adv_data[len], name_field, name_len);
-    len += name_len;
-
-    struct {
-        uint8_t length;
-        uint8_t data[31];
-    } __attribute__((packed)) adv_data_cp_struct;
-
-    adv_data_cp_struct.length = (uint8_t)len;
-    memset(adv_data_cp_struct.data, 0, sizeof(adv_data_cp_struct.data));
-    memcpy(adv_data_cp_struct.data, adv_data, len);
-
-    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_DATA,
-                     len + 1, &adv_data_cp_struct) < 0) {
-        perror("[BLE] Failed to set advertising data (ME)");
-        close(sock);
-        return -1;
-    }
-
-    uint8_t enable = 0x01;
-    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE,
-                     1, &enable) < 0) {
-        perror("[BLE] Failed to enable advertising (ME)");
-        close(sock);
-        return -1;
-    }
-
-    printf("[COMM] MAG END advertising start (20 seconds)\n");
-    sleep(20); // ★ 20秒に延長 (親機のON時間およびタイムアウトに合わせる)
-
-    enable = 0x00;
-    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE,
-                     1, &enable) < 0) {
-        perror("[BLE] Failed to disable advertising (ME)");
-    }
-    printf("[COMM] MAG END advertising stop\n");
-
-    close(sock);
-    return 0;
-}
-
-// ==========================================================
-// 修正: センサー準備完了を知らせる ADV ("READY") を継続的に送信
-// Local Name: "READY"
-// ==========================================================
+// READY: 10秒間、複数回アドバタイズ (ログ削減)
 int BLE_send_ready(const char *my_addr) {
-    printf("[COMM] Sending READY advertise from %s (Persistent)\n", my_addr);
+    // ★ ログ削減: 広告開始メッセージを簡略化
+    printf("[COMM] Sending READY advertise.\n");
 
     int dev_id = hci_get_route(NULL);
-    if (dev_id < 0) {
-        perror("[BLE] hci_get_route (READY)");
-        return -1;
-    }
-
+    if (dev_id < 0) { perror("[BLE] hci_get_route (READY)"); return -1; }
     int sock = hci_open_dev(dev_id);
-    if (sock < 0) {
-        perror("[BLE] hci_open_dev (READY)");
-        return -1;
-    }
+    if (sock < 0) { perror("[BLE] hci_open_dev (READY)"); return -1; }
 
-    le_set_advertising_parameters_cp adv_params_cp;
-    memset(&adv_params_cp, 0, sizeof(adv_params_cp));
-    uint16_t interval = (uint16_t)(500 * 1.6);
-    adv_params_cp.min_interval     = htobs(interval);
-    adv_params_cp.max_interval     = htobs(interval);
-    adv_params_cp.advtype          = 0x00;
-    adv_params_cp.own_bdaddr_type  = 0x00;
-    adv_params_cp.chan_map         = 0x07;
-    adv_params_cp.filter           = 0x00;
-
-    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_PARAMETERS,
-                     sizeof(adv_params_cp), &adv_params_cp) < 0) {
-        perror("[BLE] Failed to set advertising parameters (READY)");
+    if (setup_adv_parameters(sock, 100) < 0) { // 100ms間隔で設定
         close(sock);
         return -1;
     }
@@ -379,8 +255,6 @@ int BLE_send_ready(const char *my_addr) {
     uint8_t adv_data[31];
     memset(adv_data, 0, sizeof(adv_data));
     int len = 0;
-
-    // Flags
     adv_data[len++] = 2;
     adv_data[len++] = 0x01;
     adv_data[len++] = 0x06;
@@ -388,8 +262,8 @@ int BLE_send_ready(const char *my_addr) {
     const char *name_field = "READY";
     int name_len = (int)strlen(name_field);
     adv_data[len++] = (uint8_t)(name_len + 1);
-    adv_data[len++] = 0x09; // Complete Local Name
-    memcpy(&adv_data[len], name_field, name_len);
+    adv_data[len++] = 0x09;
+    memcpy(adv_data + len, name_field, name_len);
     len += name_len;
 
     struct {
@@ -408,35 +282,40 @@ int BLE_send_ready(const char *my_addr) {
         return -1;
     }
 
+    // 10秒間、短いサイクルで広告をON/OFF
+    time_t start_time = time(NULL);
     uint8_t enable = 0x01;
-    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE,
-                     1, &enable) < 0) {
-        perror("[BLE] Failed to enable advertising (READY)");
-        close(sock);
-        return -1;
+    uint8_t disable = 0x00;
+
+    while (time(NULL) - start_time < 10) {
+        if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, 1, &enable) < 0) {
+            perror("[BLE] Failed to enable advertising (READY)");
+            break;
+        }
+        usleep(100000); // 100ms 広告
+        
+        if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, 1, &disable) < 0) {
+             perror("[BLE] Failed to disable advertising (READY)");
+             break;
+        }
+        usleep(50000); // 50ms 停止
     }
 
-    printf("[COMM] READY advertising started. (Socket: %d)\n", sock);
-    
-    // 継続広告のため、sleep と disable を削除。ソケットを開いたまま返す。
-    return sock; // ソケットディスクリプタを返す
+    // ★ ログ削減: 広告終了メッセージを簡略化
+    printf("[COMM] READY advertising finished.\n");
+    close(sock);
+    return 0;
 }
 
 // ==========================================================
-// MCP + BNO055 センサーロジック (CH1-CH6対応)
+// BNO055/ADC (変更なし)
 // ==========================================================
-
 #define SPI_CH      0
 #define SPI_SPEED   1000000
-// 変更: CH1からCH6まで使用するため、配列サイズは7 (インデックス0は未使用、1～6使用)
-#define NUM_CH      7 
-
-// ★ しきい値まわり（hall_bno2 に寄せる）
-#define DIFF_THRESHOLD        0.020   // 0.02V 以上を検出
-#define SECOND_MARGIN         0.0     // 一旦未使用
-#define STABLE_COUNT_REQUIRED 1       // 1回で確定させる
-
-#define BASELINE_SAMPLES 50
+#define NUM_CH      7
+#define DIFF_THRESHOLD        0.020
+#define STABLE_COUNT_REQUIRED 1
+#define BASELINE_SAMPLES      50
 
 #define I2C_DEV_PATH       "/dev/i2c-1"
 #define BNO055_ADDRESS     0x28
@@ -446,180 +325,267 @@ int BLE_send_ready(const char *my_addr) {
 #define BNO055_OPR_MODE_ADDR   0x3D
 #define OPERATION_MODE_NDOF    0x0C
 #define EULER_UNIT             16.0f
-
 const char *OFFSET_FILE  = "bno055_heading_offset.txt";
 static int i2c_fd = -1;
 
-// --- センサー基本関数 ---
 static void msleep(int ms) { usleep(ms * 1000); }
 
 static int i2c_open(void) {
     i2c_fd = open(I2C_DEV_PATH, O_RDWR);
-    if (i2c_fd < 0) {
-        perror("open(/dev/i2c-1)");
-        return -1;
-    }
-    if (ioctl(i2c_fd, I2C_SLAVE, BNO055_ADDRESS) < 0) {
-        perror("ioctl(I2C_SLAVE)");
-        close(i2c_fd);
-        i2c_fd = -1;
-        return -1;
-    }
-    return 0;
-}
-
-static int i2c_write8(uint8_t reg, uint8_t value) {
-    uint8_t buf[2] = { reg, value };
-    if (write(i2c_fd, buf, 2) != 2) {
-        perror("i2c_write8");
-        return -1;
-    }
-    return 0;
-}
-
-static int i2c_read_len(uint8_t reg, uint8_t *buf, int len) {
-    if (write(i2c_fd, &reg, 1) != 1) {
-        perror("i2c_read_len:write(reg)");
-        return -1;
-    }
-    if (read(i2c_fd, buf, len) != len) {
-        perror("i2c_read_len:read");
-        return -1;
-    }
+    if (i2c_fd < 0) { perror("open(/dev/i2c-1)"); return -1; }
+    if (ioctl(i2c_fd, I2C_SLAVE, BNO055_ADDRESS) < 0) { perror("ioctl(I2C_SLAVE)"); close(i2c_fd); i2c_fd = -1; return -1; }
     return 0;
 }
 
 static int bno055_set_mode(uint8_t mode) {
-    if (i2c_write8(BNO055_OPR_MODE_ADDR, mode) < 0) return -1;
+    uint8_t buf[2] = { BNO055_OPR_MODE_ADDR, mode };
+    if (write(i2c_fd, buf, 2) != 2) return -1;
     msleep(30);
     return 0;
 }
 
 static int bno055_init_ndof(void) {
     uint8_t id;
-    if (i2c_read_len(BNO055_CHIP_ID_ADDR, &id, 1) < 0) {
-        fprintf(stderr, "Failed to read chip ID\n");
-        return -1;
-    }
-    if (id != BNO055_ID_EXPECTED) {
-        fprintf(stderr, "Unexpected BNO055 ID: 0x%02X (expected 0x%02X)\n",
-                id, BNO055_ID_EXPECTED);
-        return -1;
-    }
+    uint8_t reg = BNO055_CHIP_ID_ADDR;
+    if (write(i2c_fd, &reg, 1) != 1) return -1;
+    if (read(i2c_fd, &id, 1) != 1) return -1;
+    if (id != BNO055_ID_EXPECTED) return -1;
     printf("BNO055 detected! ID=0x%02X\n", id);
-
-    if (bno055_set_mode(OPERATION_MODE_NDOF) < 0) {
-        fprintf(stderr, "Failed to set NDOF mode\n");
-        return -1;
-    }
+    if (bno055_set_mode(OPERATION_MODE_NDOF) < 0) return -1;
     msleep(50);
     printf("BNO055 initialized in NDOF mode.\n");
     return 0;
 }
 
 float read_bno055_heading(int fd, float heading_offset) {
-    (void)fd; // i2c_fdをグローバルで使っているので未使用扱い
+    (void)fd;
+    uint8_t reg = BNO055_EUL_HEADING_LSB;
     uint8_t buf[2];
-    if (i2c_read_len(BNO055_EUL_HEADING_LSB, buf, 2) < 0) {
-        return NAN;
-    }
+    if (write(i2c_fd, &reg, 1) != 1) return NAN;
+    if (read(i2c_fd, buf, 2) != 2) return NAN;
     int16_t raw_heading = (int16_t)((buf[1] << 8) | buf[0]);
     float heading_raw   = raw_heading / EULER_UNIT;
     float heading_north = heading_raw - heading_offset;
-
     while (heading_north < 0.0f)    heading_north += 360.0f;
     while (heading_north >= 360.0f) heading_north -= 360.0f;
-
     return heading_north;
 }
 
 int load_heading_offset(const char *path, float *offset) {
     FILE *fp = fopen(path, "r");
     if (!fp) return -1;
-    if (fscanf(fp, "%f", offset) != 1) {
-        fclose(fp);
-        return -1;
-    }
+    if (fscanf(fp, "%f", offset) != 1) { fclose(fp); return -1; }
     fclose(fp);
     return 0;
 }
 
-// MCP3008/3208 風 10bit 読み出し
 double read_adc_voltage(int ch) {
     unsigned char data[3];
     data[0] = 1;
     data[1] = (8 + ch) << 4;
     data[2] = 0;
-
     wiringPiSPIDataRW(SPI_CH, data, 3);
-
     int value = ((data[1] & 3) << 8) | data[2];
     double voltage = (double)value * 3.3 / 1023.0;
     return voltage;
 }
 
-// ---------------------------------------------------------
-// 子機側: 親の "MT:<自分のアドレス>" アドバタイズを監視するスレッド
-// ---------------------------------------------------------
-void *mag_scan_thread(void *arg) {
-    (void)arg;
+// ==========================================================
+// 子機側マッピング保存構造体 (変更なし)
+// ==========================================================
+#define CHILD_MAX_MAP  32
 
-    int dev_id = hci_get_route(NULL);
-    if (dev_id < 0) {
-        perror("[SCAN] hci_get_route");
-        return NULL;
+typedef struct {
+    int  valid;
+    int  key;
+    char addr[18];
+    int  x;
+    int  y;
+    int  z;
+} ChildMapEntry;
+
+static ChildMapEntry g_child_map[CHILD_MAX_MAP];
+
+static void child_map_init(void) {
+    for (int i = 0; i < CHILD_MAX_MAP; i++) {
+        g_child_map[i].valid = 0;
+        g_child_map[i].key   = 0;
+        g_child_map[i].addr[0] = '\0';
+        g_child_map[i].x = g_child_map[i].y = g_child_map[i].z = 0;
     }
+}
+
+// "DCA6329A77A1" → "DC:A6:32:9A:77:A1" (変更なし)
+static void expand_compact_addr12(const char *compact, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return;
+
+    if (!compact) {
+        snprintf(out, out_size, "UNKNOWN");
+        return;
+    }
+    size_t len = strlen(compact);
+    if (len < 12) {
+        snprintf(out, out_size, "%s", compact);
+        return;
+    }
+
+    char buf[18];
+    int j = 0;
+    for (int i = 0; i < 12 && j < 17; i += 2) {
+        buf[j++] = compact[i];
+        if (j >= 17) break;
+        buf[j++] = compact[i + 1];
+        if (i != 10 && j < 17) {
+            buf[j++] = ':';
+        }
+    }
+    buf[j] = '\0';
+    snprintf(out, out_size, "%s", buf);
+}
+
+// 新しい key or 座標を初めて見たときだけ printf (変更なし)
+static void child_store_map_frame(int key,
+                                  const char *addr,
+                                  int x, int y, int z)
+{
+    for (int i = 0; i < CHILD_MAX_MAP; i++) {
+        if (g_child_map[i].valid && g_child_map[i].key == key) {
+            if (g_child_map[i].x == x &&
+                g_child_map[i].y == y &&
+                g_child_map[i].z == z) {
+                return;
+            } else {
+                g_child_map[i].x = x;
+                g_child_map[i].y = y;
+                g_child_map[i].z = z;
+                if (addr && addr[0] != '\0') {
+                    strncpy(g_child_map[i].addr, addr, sizeof(g_child_map[i].addr));
+                    g_child_map[i].addr[sizeof(g_child_map[i].addr) - 1] = '\0';
+                }
+                printf("[MAP-RECV] key=%d addr=%s -> (%d,%d,%d) (UPDATED)\n",
+                       key,
+                       g_child_map[i].addr[0] ? g_child_map[i].addr : "UNKNOWN",
+                       x, y, z);
+                return;
+            }
+        }
+    }
+
+    for (int i = 0; i < CHILD_MAX_MAP; i++) {
+        if (!g_child_map[i].valid) {
+            g_child_map[i].valid = 1;
+            g_child_map[i].key   = key;
+            g_child_map[i].x     = x;
+            g_child_map[i].y     = y;
+            g_child_map[i].z     = z;
+            if (addr && addr[0] != '\0') {
+                strncpy(g_child_map[i].addr, addr, sizeof(g_child_map[i].addr));
+                g_child_map[i].addr[sizeof(g_child_map[i].addr) - 1] = '\0';
+            } else {
+                g_child_map[i].addr[0] = '\0';
+            }
+
+            printf("[MAP-RECV] key=%d addr=%s -> (%d,%d,%d)\n",
+                   key,
+                   g_child_map[i].addr[0] ? g_child_map[i].addr : "UNKNOWN",
+                   x, y, z);
+            return;
+        }
+    }
+
+    fprintf(stderr, "[WARN] Child map table full. Could not store key=%d\n", key);
+}
+
+// 子機側マップを親機と同じ形式でファイル保存 (変更なし)
+static void child_dump_map_summary(const char *parent_addr) {
+    printf("\n===== 受信したマッピング情報 (Child) =====\n");
+    printf("Parent: %s\n", parent_addr);
+    for (int i = 0; i < CHILD_MAX_MAP; i++) {
+        if (g_child_map[i].valid) {
+            printf("Key: %d, Addr: %s, Coords: (%d, %d, %d)\n",
+                   g_child_map[i].key,
+                   g_child_map[i].addr[0] ? g_child_map[i].addr : "UNKNOWN",
+                   g_child_map[i].x,
+                   g_child_map[i].y,
+                   g_child_map[i].z);
+        }
+    }
+    printf("============================================\n");
+
+    FILE *fp = fopen(CHILD_MAP_FILE_PATH, "w");
+    if (!fp) return;
+
+    fprintf(fp, "# Cube Mapping Log\n");
+    fprintf(fp, "\n# Final Cube Coordinates\n");
+    for (int i = 0; i < CHILD_MAX_MAP; i++) {
+        if (g_child_map[i].valid) {
+            fprintf(fp, "[%s] Key: %d, Coords: (%d, %d, %d)\n",
+                    g_child_map[i].addr[0] ? g_child_map[i].addr : "UNKNOWN",
+                    g_child_map[i].key,
+                    g_child_map[i].x,
+                    g_child_map[i].y,
+                    g_child_map[i].z);
+        }
+    }
+    fprintf(fp, "\n# Raw Reports\n");
+    fclose(fp);
+}
+
+// ==========================================================
+// BLE スキャン (変更なし)
+// ==========================================================
+int BLE_scan_for_targets(const char *target_addr, int timeout_ms, int phase) {
+    int dev_id = hci_get_route(NULL);
+    if (dev_id < 0) return 0;
 
     int sock = hci_open_dev(dev_id);
-    if (sock < 0) {
-        perror("[SCAN] hci_open_dev");
-        return NULL;
-    }
+    if (sock < 0) return 0;
 
     struct hci_filter nf;
     hci_filter_clear(&nf);
     hci_filter_set_ptype(HCI_EVENT_PKT, &nf);
     hci_filter_set_event(EVT_LE_META_EVENT, &nf);
-    if (setsockopt(sock, SOL_HCI, HCI_FILTER, &nf, sizeof(nf)) < 0) {
-        perror("[SCAN] HCI filter");
-        close(sock);
-        return NULL;
-    }
+    setsockopt(sock, SOL_HCI, HCI_FILTER, &nf, sizeof(nf));
 
     le_set_scan_parameters_cp scan_params_cp;
     memset(&scan_params_cp, 0, sizeof(scan_params_cp));
-    scan_params_cp.type = 0x01;               // Active scan
+    scan_params_cp.type = 0x01;
     scan_params_cp.interval = htobs(0x0010);
     scan_params_cp.window   = htobs(0x0010);
-    scan_params_cp.own_bdaddr_type = 0x00;    // Public
+    scan_params_cp.own_bdaddr_type = 0x00;
     scan_params_cp.filter   = 0x00;
 
-    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_SCAN_PARAMETERS,
-                     sizeof(scan_params_cp), &scan_params_cp) < 0) {
-        perror("[SCAN] set scan params");
-        close(sock);
-        return NULL;
-    }
+    hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_SCAN_PARAMETERS,
+                 sizeof(scan_params_cp), &scan_params_cp);
 
     uint8_t enable = 0x01;
     uint8_t filter_dup = 0x00;
     uint8_t cmd[2] = { enable, filter_dup };
-    if (hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE,
-                     sizeof(cmd), cmd) < 0) {
-        perror("[SCAN] enable scan");
-        close(sock);
-        return NULL;
-    }
+    hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE,
+                 sizeof(cmd), cmd);
 
     unsigned char buf[HCI_MAX_EVENT_SIZE];
+    struct timeval tv = {
+        .tv_sec  = timeout_ms / 1000,
+        .tv_usec = (timeout_ms % 1000) * 1000
+    };
 
-    printf("[SCAN] 子機スキャンスレッド開始 (MT: 自分宛ての電磁石タイム要求を監視)\n");
+    int ret_val = 0;
 
-    while (1) {
+    while (ret_val == 0) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(sock, &fds);
+
+        struct timeval current_tv = tv;
+
+        int r = select(sock + 1, &fds, NULL, NULL, &current_tv);
+        if (r <= 0) break;
+
         int len = read(sock, buf, sizeof(buf));
         if (len < 0) {
             if (errno == EINTR) continue;
-            perror("[SCAN] read");
             break;
         }
         if (len < (1 + HCI_EVENT_HDR_SIZE)) continue;
@@ -638,10 +604,9 @@ void *mag_scan_thread(void *arg) {
             int pos = 0;
             while (pos < info->length) {
                 uint8_t field_len = info->data[pos];
-                if (field_len == 0) break;
-                if (pos + field_len >= info->length) break;
-
+                if (field_len == 0 || pos + field_len >= info->length) break;
                 uint8_t field_type = info->data[pos + 1];
+
                 if (field_type == 0x09 || field_type == 0x08) {
                     int name_len = field_len - 1;
                     if (name_len > (int)sizeof(name)-1)
@@ -653,46 +618,99 @@ void *mag_scan_thread(void *arg) {
             }
 
             if (name[0] != '\0') {
-                // Local Name が "MT:<addr>" 形式かチェック
-                if (strncmp(name, "MT:", 3) == 0) {
-                    const char *addr_part = name + 3;
+                // フェーズ0: 自分宛 MT
+                if (phase == 0 &&
+                    strncmp(name, "MT:", 3) == 0 &&
+                    strcmp(name + 3, target_addr) == 0) {
                     pthread_mutex_lock(&mag_state_mutex);
-                    if (strcmp(addr_part, g_my_addr) == 0 && !electromagnet_requested) {
+                    if (!electromagnet_requested) {
                         electromagnet_requested = 1;
-                        printf("\n[MAG] 自分宛ての電磁石タイム要求(MT)を検知しました。\n");
-                        
-                        // ★ 要求を検知したらスキャンを停止し、スレッドを終了する
-                        enable = 0x00;
-                        cmd[0] = enable;
-                        cmd[1] = 0x00;
-                        hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE,
-                                     sizeof(cmd), cmd);
-                        close(sock);
-                        pthread_mutex_unlock(&mag_state_mutex);
-                        return NULL; // スレッド終了
+                        printf("\n[SCAN] フェーズ1: 自分宛ての電磁石タイム要求(MT)を検知しました。\n");
+                        ret_val = 1;
                     }
                     pthread_mutex_unlock(&mag_state_mutex);
+                    break;
+                }
+
+                // フェーズ1: MK / MAP_END
+                if (phase == 1) {
+                    // --- MKフレームのパース ---
+                    const char *p = NULL;
+                    if (strncmp(name, "MK:", 3) == 0) {
+                        p = name + 3;
+                    } else if (strncmp(name, "MAPK:", 5) == 0) {
+                        // 旧形式互換（念のため）
+                        p = name + 5;
+                    }
+
+                    if (p) {
+                        char *endp;
+                        long key = strtol(p, &endp, 10);
+                        if (endp && *endp == ':') {
+                            p = endp + 1;
+
+                            char full_addr[18];
+                            full_addr[0] = '\0';
+
+                            const char *next_colon  = strchr(p, ':');
+                            const char *first_comma = strchr(p, ',');
+
+                            if (next_colon && (!first_comma || next_colon < first_comma)) {
+                                // 新形式: MK:<key>:<ADDR12>:x,y,z
+                                char compact[13];
+                                size_t addr_len = (size_t)(next_colon - p);
+                                if (addr_len >= sizeof(compact))
+                                    addr_len = sizeof(compact) - 1;
+                                memcpy(compact, p, addr_len);
+                                compact[addr_len] = '\0';
+
+                                expand_compact_addr12(compact, full_addr, sizeof(full_addr));
+                                p = next_colon + 1;
+                            } else {
+                                // 旧: MK:<key>:x,y,z / MAPK:<key>:x,y,z
+                                snprintf(full_addr, sizeof(full_addr), "UNKNOWN");
+                            }
+
+                            long x = strtol(p, &endp, 10);
+                            if (endp && *endp == ',') {
+                                p = endp + 1;
+                                long y = strtol(p, &endp, 10);
+                                if (endp && *endp == ',') {
+                                    p = endp + 1;
+                                    long z = strtol(p, &endp, 10);
+                                    child_store_map_frame((int)key,
+                                                          full_addr,
+                                                          (int)x, (int)y, (int)z);
+                                }
+                            }
+                        }
+                    }
+
+                    // MAP_END
+                    if (strncmp(name, "MAP_END:", 8) == 0) {
+                        printf("\n[SCAN] フェーズ2: 親機からのマッピング送信完了通知を受信: %s\n", name);
+                        ret_val = 2;
+                        map_end_received = 1;
+                        break;
+                    }
                 }
             }
 
             offset = (uint8_t *)info + sizeof(*info) + info->length;
         }
+        if (ret_val != 0) break;
     }
 
-    // 通常は到達しない
-    enable = 0x00;
-    cmd[0] = enable;
-    cmd[1] = 0x00;
-    hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE,
-                 sizeof(cmd), cmd);
-
+    uint8_t disable2 = 0x00;
+    cmd[0] = disable2; cmd[1] = 0x00;
+    hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE, sizeof(cmd), cmd);
     close(sock);
-    return NULL;
+    return ret_val;
 }
 
-// ---------------------------------------------------------
-// 子機のメイン関数
-// ---------------------------------------------------------
+// ==========================================================
+// main (センサー検知ロジックを修正)
+// ==========================================================
 int main(int argc, char *argv[])
 {
     if (argc < 3) {
@@ -702,18 +720,16 @@ int main(int argc, char *argv[])
     }
     const char *my_addr     = CHILD_ADDR_ARG;
     const char *parent_addr = PARENT_ADDR_ARG;
-    
-    // グローバルコピー（スキャンスレッドが使う）
+
     strncpy(g_my_addr, my_addr, sizeof(g_my_addr));
     g_my_addr[sizeof(g_my_addr) - 1] = '\0';
-    
+
     printf("\n==================================\n");
     printf("🌱 CHILD PROGRAM STARTING\n");
     printf("==================================\n");
     printf("My full address (Child): **%s**\n", my_addr);
     printf("Confirmed Parent Address: **%s**\n", parent_addr);
-    
-    // I/O初期化
+
     if (wiringPiSetup() != 0) {
         fprintf(stderr, "wiringPiSetup failed.\n");
         return 1;
@@ -725,18 +741,15 @@ int main(int argc, char *argv[])
     if (i2c_open() < 0 || bno055_init_ndof() < 0) {
         return 1;
     }
-    
-    // ★★★ GPIO Base アドレス読み込み ★★★
-    // NOTE: gpiochip512 のパスは環境によって異なる可能性があります。
-    int base = readInt("/sys/class/gpio/gpiochip512/base"); 
+
+    int base = readInt("/sys/class/gpio/gpiochip512/base");
     if (base < 0) {
-        fprintf(stderr, "ERROR: Failed to read GPIO base address. Check /sys/class/gpio/gpiochip*/base. Aborting.\n");
+        fprintf(stderr, "ERROR: Failed to read GPIO base address.\n");
         close(i2c_fd);
         return 1;
     }
     g_linux_gpio = base + BCM_GPIO_PIN;
     printf("Resolved Child GPIO Pin: %d (BCM %d)\n", g_linux_gpio, BCM_GPIO_PIN);
-    // --------------------------------
 
     float heading_offset = 0.0f;
     if (load_heading_offset(OFFSET_FILE, &heading_offset) != 0) {
@@ -745,11 +758,10 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // ベースライン計測 (CH1-CH6)
-    double baseline[NUM_CH] = {0}; 
+    double baseline[NUM_CH] = {0};
     printf("Baseline sampling...\n");
     for (int s = 0; s < BASELINE_SAMPLES; s++) {
-        for (int ch = 1; ch < NUM_CH; ch++) { // CH1からCH6までをループ
+        for (int ch = 1; ch < NUM_CH; ch++) {
             baseline[ch] += read_adc_voltage(ch);
         }
         usleep(100000);
@@ -759,123 +771,98 @@ int main(int argc, char *argv[])
     }
     printf("Baseline established.\n");
 
-    // ★ 準備完了(READY)を親機に通知 (常時広告ソケットを取得)
-    int ready_sock = BLE_send_ready(my_addr);
-    if (ready_sock < 0) {
-        fprintf(stderr, "Failed to start persistent READY advertising.\n");
+    // ★ READY を 10秒間、複数回広告
+    if (BLE_send_ready(my_addr) < 0) {
+        fprintf(stderr, "Failed to send READY advertising.\n");
         close(i2c_fd);
         return 1;
     }
 
-    // 親の MT アドバタイズを監視するスレッド開始
-    pthread_t scan_th;
-    if (pthread_create(&scan_th, NULL, mag_scan_thread, NULL) != 0) {
-        perror("mag_scan_thread の生成に失敗しました");
-        // 生成失敗しても、電磁石タイム機能なしで動作を継続
-    }
+    child_map_init();
 
     printf("Begin continuous monitoring...\n");
 
     static char last_surface[16] = "";
     static int  same_count = 0;
+
+    g_scan_phase = 0;
+    printf("[PHASE] Starting in Phase 1 (MT monitoring).\n");
     
-    while (1)
+    // スキャンタイムアウト時間 (50ms)
+    int scan_timeout_ms = 50;
+
+    while (!map_end_received)
     {
-        // --- 電磁石タイム要求が来ていないかチェック ---
+        // 1. スキャンを実行 (MT検出のため)
+        int scan_result = BLE_scan_for_targets(g_my_addr, scan_timeout_ms, g_scan_phase);
+
+        if (scan_result == 2) {
+            break;
+        }
+
+        // 2. MT/MAP_END 処理
         pthread_mutex_lock(&mag_state_mutex);
-        int mag_req = electromagnet_requested;
+        int mag_req    = electromagnet_requested;
         int mag_active = electromagnet_active;
         if (mag_req) {
-            electromagnet_requested = 0; // 要求を消費
-            electromagnet_active = 1;    // 電磁石を駆動
+            electromagnet_requested = 0;
+            electromagnet_active    = 1;
         }
         pthread_mutex_unlock(&mag_state_mutex);
 
         if (mag_req) {
-            // **電磁石タイム本体 (自分自身を駆動)**
+            // --- 電磁石駆動フェーズ (MT命令受信) ---
             printf("\n===== 電磁石タイム START (自分自身を駆動) =====\n");
-            
-            // ★ READY広告の一時停止
-            uint8_t enable = 0x00;
-            if (hci_send_cmd(ready_sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE,
-                             1, &enable) < 0) {
-                perror("[COMM] Failed to disable READY advertising before MAG START");
-            }
-            printf("[COMM] READY advertising temporarily stopped.\n");
 
-            // ★ 1. ON コマンドを実行を関数呼び出しに置き換え
             if (gpio_init_and_on() != 0) {
-                 // ON失敗時のリカバリ
                  pthread_mutex_lock(&mag_state_mutex);
-                 electromagnet_active = 0; 
+                 electromagnet_active = 0;
                  pthread_mutex_unlock(&mag_state_mutex);
-
-                 // READY再開
-                 enable = 0x01;
-                 hci_send_cmd(ready_sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, 1, &enable);
-                 continue; 
+                 continue;
             }
-            
-            // 2. 終了を親に通知 (20秒間 "ME" をアドバタイズ)
-            BLE_send_mag_end(my_addr);
 
-            // ★ 3. OFF コマンドを実行を関数呼び出しに置き換え
+            printf("[MAG] 電磁石 ON (20秒)\n");
+            sleep(20);
+
             gpio_off_and_unexport();
-            
+
+            printf("[MAG] クールダウン (5秒) と MAP 配布受信への準備期間。\n");
+            sleep(5);
+
             pthread_mutex_lock(&mag_state_mutex);
-            electromagnet_active = 0; // 電磁石駆動終了
+            electromagnet_active = 0;
             pthread_mutex_unlock(&mag_state_mutex);
-            
-            // ★ READY広告の再開
-            enable = 0x01;
-            if (hci_send_cmd(ready_sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE,
-                             1, &enable) < 0) {
-                perror("[COMM] Failed to re-enable READY advertising");
-            }
-            printf("[COMM] READY advertising re-enabled.\n");
 
+            g_scan_phase = 1;
+            printf("[PHASE] Transitioned to Phase 2 (MAP 配布受信モード).\n");
 
-            printf("===== 電磁石タイム END (ME送信完了) =====\n");
-            // 連続送信防止用の sleep(2)
-            sleep(2); 
+            printf("===== 電磁石タイム END (MAP配布受信モードへ移行) =====\n");
             continue;
         }
 
-        // ここから先は従来のセンサー監視ロジック（電磁石駆動中はスキップ）
-        if (mag_active) {
-            // 親からの ME 受信を待っている間はセンサーをポーリングしない
-            usleep(100000);
+        if (g_scan_phase == 1 || mag_active) {
+            usleep(100000); 
             continue;
         }
 
+        // 3. 通常センサー監視 (MT待ち中のみ) - 毎回実行
         double window[NUM_CH];
-        for (int ch = 1; ch < NUM_CH; ch++) { // CH1からCH6までをループ
+        for (int ch = 1; ch < NUM_CH; ch++) {
             window[ch] = read_adc_voltage(ch);
         }
 
         double maxDiff    = 0.0;
-        double secondDiff = 0.0;
         int    maxCh      = -1;
-        int    secondCh   = -1;
 
-        for (int ch = 1; ch < NUM_CH; ch++) { // CH1からCH6までをループ
-            // 1.0V未満は無視
+        for (int ch = 1; ch < NUM_CH; ch++) {
             if (baseline[ch] < 1.0 || window[ch] < 1.0) continue;
-
             double diff = fabs(window[ch] - baseline[ch]);
-
             if (diff > maxDiff) {
-                secondDiff = maxDiff;
-                secondCh   = maxCh;
-                maxDiff    = diff;
-                maxCh      = ch;
-            } else if (diff > secondDiff) {
-                secondDiff = diff;
-                secondCh   = ch;
+                maxDiff = diff;
+                maxCh   = ch;
             }
         }
-        
-        // ★ 「しきい値」だけで候補かどうか判定（hall_bno2 っぽく緩く）
+
         int is_candidate = 0;
         if (maxCh != -1 && maxDiff >= DIFF_THRESHOLD) {
             is_candidate = 1;
@@ -887,37 +874,28 @@ int main(int argc, char *argv[])
             const char* detected_surface = "UNKNOWN";
 
             if (!isnan(heading_north)) {
-                // TOP / BOTTOM 判定
-                if (maxCh == 1)      detected_surface = "TOP";   // CH1 = 上
-                else if (maxCh == 6) detected_surface = "BOTTOM";// CH6 = 下
+                if (maxCh == 1)      detected_surface = "TOP";
+                else if (maxCh == 6) detected_surface = "BOTTOM";
                 else {
-                    // 側面 (CH2, CH3, CH4, CH5) の処理
-                    
-                    // 1. Headingに基づいて回転セクションを決定
-                    int rotation_index = 0; 
-                    
-                    if (heading_north >= 45.0f  && heading_north < 135.0f) rotation_index = 1; // 東向き (90度回転)
-                    else if (heading_north >= 135.0f && heading_north < 225.0f) rotation_index = 2; // 南向き (180度回転)
-                    else if (heading_north >= 225.0f && heading_north < 315.0f) rotation_index = 3; // 西向き (270度回転)
-                    else rotation_index = 0; // 北向き (0度回転)
-                    
-                    // 2. CHの物理的な初期位置から、回転後の真の向きを決定
-                    // CH2=FRONT(0), CH3=LEFT(1), CH4=BACK(2), CH5=RIGHT(3)
+                    int rotation_index = 0;
+                    if (heading_north >= 45.0f  && heading_north < 135.0f) rotation_index = 1;
+                    else if (heading_north >= 135.0f && heading_north < 225.0f) rotation_index = 2;
+                    else if (heading_north >= 225.0f && heading_north < 315.0f) rotation_index = 3;
+                    else rotation_index = 0;
+
                     int initial_index = -1;
-                    if (maxCh == 2)      initial_index = 0; // 物理FRONT
-                    else if (maxCh == 3) initial_index = 1; // 物理LEFT
-                    else if (maxCh == 4) initial_index = 2; // 物理BACK
-                    else if (maxCh == 5) initial_index = 3; // 物理RIGHT
-                    
+                    if (maxCh == 2)      initial_index = 0;
+                    else if (maxCh == 3) initial_index = 1;
+                    else if (maxCh == 4) initial_index = 2;
+                    else if (maxCh == 5) initial_index = 3;
+
                     if (initial_index != -1) {
-                        // 回転後のインデックスを計算: (初期位置 + 回転量) % 4
                         int mapped_index = (initial_index + rotation_index) % 4;
                         const char* final_names[] = {"FRONT", "LEFT", "BACK", "RIGHT"};
                         detected_surface = final_names[mapped_index];
                     }
                 }
 
-                // ★ 同じ面が連続しているかをチェック（ただし STABLE_COUNT_REQUIRED=1）
                 char current_surface[16];
                 strncpy(current_surface, detected_surface, sizeof(current_surface));
                 current_surface[sizeof(current_surface)-1] = '\0';
@@ -930,21 +908,16 @@ int main(int argc, char *argv[])
                     same_count = 1;
                 }
 
-                printf("\n[EVENT CANDIDATE] CH%d Diff: %.3f V -> Surface: %s (same_count=%d)\n",
-                       maxCh, maxDiff, current_surface, same_count);
-
-                // ★ 連続 STABLE_COUNT_REQUIRED 回同じ面が出たら「確定」
                 if (same_count >= STABLE_COUNT_REQUIRED) {
+                    // 確定ログは残す
                     printf("\n[EVENT CONFIRMED] CH%d detected (Diff: %.3f V) -> Surface: **%s**\n",
                            maxCh, maxDiff, current_surface);
-
+                    
+                    // Surface-report を複数回広告
                     BLE_send_surface_data(my_addr, parent_addr, current_surface);
-
-                    // 連続検出をリセット
+                    
                     same_count = 0;
                     last_surface[0] = '\0';
-
-                    sleep(2); // 連続送信防止
                 }
 
             } else {
@@ -952,16 +925,16 @@ int main(int argc, char *argv[])
                         "[WARNING] Failed to read BNO055 heading during detection.\n");
             }
         }
-
-        usleep(100000);
+        usleep(100000); // センサーチェック後のわずかな待機
     }
-    
-    close(ready_sock); // ★ プログラム終了時にソケットを閉じる
-    close(i2c_fd);
-    
-    // ★ プログラム終了時に念のためOFF/アンエクスポートを保証
-    gpio_off_and_unexport(); 
-    
+
+    printf("\n\n===== マッピング終了通知(MAP_END)を受信しました。子機プログラムを終了します。 =====\n");
+
+    child_dump_map_summary(parent_addr);
+
+    if (i2c_fd != -1) close(i2c_fd);
+    gpio_off_and_unexport();
+
+    printf("CHILD PROGRAM END\n");
     return 0;
 }
-

@@ -1,0 +1,6 @@
+# Cube Mapping Log (Child)
+# Parent: DC:A6:32:9A:77:F3
+
+# Final Cube Coordinates (Key-based)
+Key: 49, Coords: (0, 0, 0)
+Key: 95, Coords: (0, 0, 1)

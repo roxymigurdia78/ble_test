@@ -1,9 +1,9 @@
 // ================================================
 // BLE Dual "Stable Connection" Version
 // - ソケット分離による通信安定化
-// - WiringPiによるLED制御 (青:待機, 赤:選挙, 緑:成功)
-// - ★修正済: ADV_INTERVAL_MS を 50ms に短縮し、開始信号の検出速度を向上
-// - ★修正済: get_last_three をアドレス末尾2バイト（XX:XX形式, 5文字）切り出しに修正し、比較文字列の不整合を解消
+// - WiringPiによるLED制御
+// - 実行結果(Exit Code)による点滅機能
+// - ★修正: parent_key_list.txt の自動生成機能を追加
 // ================================================
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,17 +15,18 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/wait.h> // WEXITSTATUS用
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
-#include <wiringPi.h> // GPIO制御用
+#include <wiringPi.h>
 
 // --- 設定 ---
-#define ADV_INTERVAL_MS      50   // ★修正: 広告間隔を50msに短縮
-#define SCAN_INTERVAL_MS     100  // 反応速度優先
-#define SCAN_WINDOW_MS       100  // 常に聞き耳を立てる
+#define ADV_INTERVAL_MS      50   
+#define SCAN_INTERVAL_MS     100  
+#define SCAN_WINDOW_MS       100  
 #define MAX_DEVS             100
-#define PARENT_EXCHANGE_SEC  20   // 選挙時間
+#define PARENT_EXCHANGE_SEC  20   
 
 // --- GPIOピン設定 (BCM番号) ---
 #define PIN_LED_RED    12
@@ -35,7 +36,7 @@
 
 // --- グローバル変数 ---
 int dev_id;
-int global_adv_sock; // ★送信(Advertise)専用ソケット
+int global_adv_sock;
 int my_key;
 char device_name[32] = "CubeNode";
 char my_addr[18] = "(unknown)";
@@ -50,7 +51,7 @@ int detected_count = 0;
 pthread_mutex_t detected_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int parent_phase = 0; 
-char perceived_parent_addr_last3[18] = "(unknown)"; // 実際は末尾5文字（XX:XX）
+char perceived_parent_addr_last3[18] = "(unknown)";
 char perceived_parent_addr_full[18]  = "(unknown)";
 pthread_mutex_t parent_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -85,6 +86,17 @@ void led_set_green() {
     digitalWrite(PIN_LED_GREEN, 1);
 }
 
+// LED点滅関数
+void led_blink(int pin, int interval_ms) {
+    led_all_off();
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(pin, 1);
+        usleep(interval_ms * 1000);
+        digitalWrite(pin, 0);
+        usleep(interval_ms * 1000);
+    }
+}
+
 void led_init() {
     pinMode(PIN_LED_RED, OUTPUT);
     pinMode(PIN_LED_GREEN, OUTPUT);
@@ -95,41 +107,21 @@ void led_init() {
 // ==================================================
 // ユーティリティ
 // ==================================================
-int generate_unique_key(bdaddr_t *addr) {
-    unsigned int h = 0;
-    for (int i = 0; i < 6; i++) h = h * 257u + (unsigned int)addr->b[i];
-    return (int)(h & 0xFFu);
-}
-
-// ★修正箇所: get_last_threeを末尾2バイト（XX:XX形式, 5文字）切り出しに修正
 void get_last_three(const char *full_addr, char *out, size_t out_sz) {
     out[0] = '\0';
-    // 末尾2バイト (XX:XX) の切り出しに必要な長さチェック
     if (!full_addr || strlen(full_addr) < 5 || out_sz < 6) return;
-    
-    // 末尾5文字（XX:XX）の開始位置
     const char *s = full_addr + strlen(full_addr) - 5;
-    
-    // 5文字をコピー
     strncpy(out, s, 5); 
-    
-    // 6文字目を必ずNULL終端にする
     out[5] = '\0'; 
 }
 
-// 親タグからアドレスを抽出
 void extract_parent_tag_from_name(const char *name, char *out_parent, size_t out_sz) {
     out_parent[0] = '\0';
     const char *p = strstr(name, "|P:");
     if (!p) return;
-    
-    p += 3; // "|P:" の次からがアドレス
-    
+    p += 3; 
     size_t i = 0;
-    // '|' か '\0' に達するまでコピー
     while (*p != '\0' && *p != '|' && i + 1 < out_sz) out_parent[i++] = *p++;
-    
-    // 必ずNULL終端にする
     out_parent[i] = '\0';
 }
 
@@ -154,26 +146,46 @@ void set_start_flag(void) {
     if (!start_flag) {
         start_flag = 1;
         printf("[INFO] Start flag set! LED turning RED.\n");
-        led_set_red(); // ここで赤点灯
+        led_set_red(); 
     }
     pthread_mutex_unlock(&start_mutex);
 }
 
+// ★追加: 発見したデバイスリストをファイルに保存する関数
+void save_device_list_for_parent(const char *filename) {
+    FILE *fp = fopen(filename, "w");
+    if (!fp) {
+        perror("[ERROR] Failed to open key list file for writing");
+        return;
+    }
+
+    // 1. 自分自身を書き込む
+    fprintf(fp, "%d %s\n", my_key, my_addr);
+
+    // 2. 発見した他のデバイスを書き込む
+    pthread_mutex_lock(&detected_mutex);
+    for (int i = 0; i < detected_count; i++) {
+        // キーが有効(0以上)な場合のみ書き込む
+        if (detected_devices[i].key >= 0) {
+            fprintf(fp, "%d %s\n", detected_devices[i].key, detected_devices[i].addr);
+        }
+    }
+    pthread_mutex_unlock(&detected_mutex);
+
+    fclose(fp);
+    printf("[INFO] Device list auto-saved to %s (Total: %d nodes including self)\n", filename, detected_count + 1);
+}
+
 // =========================
-// 広告スレッド (★送信専用ソケット使用)
+// 広告スレッド
 // =========================
 void *advertise_thread(void *arg) {
     le_set_advertising_parameters_cp adv_params_cp;
     memset(&adv_params_cp, 0, sizeof(adv_params_cp));
-    // ADV_INTERVAL_MS に基づいて設定 (50ms)
     adv_params_cp.min_interval = htobs((uint16_t)(ADV_INTERVAL_MS * 1.6));
     adv_params_cp.max_interval = htobs((uint16_t)(ADV_INTERVAL_MS * 1.6));
     adv_params_cp.advtype = 0x00;
-    adv_params_cp.own_bdaddr_type = 0x00;
     adv_params_cp.chan_map = 0x07;
-    adv_params_cp.filter = 0x00;
-
-    // global_adv_sock を使用
     hci_send_cmd(global_adv_sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_PARAMETERS, sizeof(adv_params_cp), &adv_params_cp);
 
     uint8_t adv_data[31];
@@ -186,9 +198,9 @@ void *advertise_thread(void *arg) {
 
         char name_field[64];
         pthread_mutex_lock(&parent_mutex);
-        int pphase = parent_phase;
         char paddr_copy[18];
-        strncpy(paddr_copy, perceived_parent_addr_last3, sizeof(paddr_copy)); // 末尾2バイト（XX:XX）
+        strncpy(paddr_copy, perceived_parent_addr_last3, sizeof(paddr_copy));
+        int pphase = parent_phase;
         pthread_mutex_unlock(&parent_mutex);
 
         int sf = get_start_flag();
@@ -210,27 +222,21 @@ void *advertise_thread(void *arg) {
         adv_data_cp_struct.length = len;
         memcpy(adv_data_cp_struct.data, adv_data, len);
         
-        // global_adv_sock を使用
         hci_send_cmd(global_adv_sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_DATA, len + 1, &adv_data_cp_struct);
-
         uint8_t enable = 0x01;
         hci_send_cmd(global_adv_sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, 1, &enable);
 
-        usleep(ADV_INTERVAL_MS * 1000); // 50ms ごとに広告を繰り返す
+        usleep(ADV_INTERVAL_MS * 1000); 
     }
     return NULL;
 }
 
 // =========================
-// スキャンスレッド (★受信専用ソケット新規作成)
+// スキャンスレッド
 // =========================
 void *scan_thread(void *arg) {
-    // ★重要: ここで受信専用ソケットを作ることで通信を安定させる
     int scan_sock = hci_open_dev(dev_id);
-    if (scan_sock < 0) {
-        perror("Failed to open scan socket");
-        pthread_exit(NULL);
-    }
+    if (scan_sock < 0) pthread_exit(NULL);
 
     struct hci_filter nf;
     hci_filter_clear(&nf);
@@ -243,28 +249,19 @@ void *scan_thread(void *arg) {
     scan_params_cp.type = 0x01; 
     scan_params_cp.interval = htobs((uint16_t)(SCAN_INTERVAL_MS * 1.6));
     scan_params_cp.window   = htobs((uint16_t)(SCAN_WINDOW_MS * 1.6));
-    scan_params_cp.own_bdaddr_type = 0x00;
-    // scan_sock を使用
     hci_send_cmd(scan_sock, OGF_LE_CTL, OCF_LE_SET_SCAN_PARAMETERS, sizeof(scan_params_cp), &scan_params_cp);
 
-    uint8_t enable = 0x01;
-    uint8_t filter_dup = 0x00;
+    uint8_t enable = 0x01, filter_dup = 0x00;
     uint8_t cmd[2] = { enable, filter_dup };
     hci_send_cmd(scan_sock, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE, sizeof(cmd), cmd);
 
     unsigned char buf[HCI_MAX_EVENT_SIZE];
-
     printf("=== Waiting for button press or remote |S ===\n");
-    led_set_blue(); // 青点灯（待機）
+    led_set_blue(); 
 
-    // ★無限待機
     while (!get_start_flag()) {
         int len = read(scan_sock, buf, sizeof(buf));
-        if (len < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
-            usleep(100000); continue; 
-        }
-
+        if (len < 0) { if (errno==EINTR || errno==EAGAIN) continue; usleep(100000); continue; }
         if (len < (1 + HCI_EVENT_HDR_SIZE)) continue;
         evt_le_meta_event *meta = (evt_le_meta_event *)(buf + (1 + HCI_EVENT_HDR_SIZE));
         if (meta->subevent != EVT_LE_ADVERTISING_REPORT) continue;
@@ -306,24 +303,20 @@ void *scan_thread(void *arg) {
             }
 
             if (name[0] != '\0' && extract_start_flag_from_name(name)) {
-                printf("[INFO] Remote START detected from %s\n", addr);
-                set_start_flag(); // -> 赤点灯
+                printf("[INFO] Remote START from %s\n", addr);
+                set_start_flag(); 
             }
             offset = (uint8_t *)info + sizeof(*info) + info->length;
         }
     }
 
-    // --- 選挙開始 ---
     printf("\n=== Election running... ===\n");
-    // 赤点灯は set_start_flag() 内で行われているはずだが念のため
     led_set_red(); 
-
     uint8_t disable_cmd[2] = { 0x00, 0x00 };
     hci_send_cmd(scan_sock, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE, sizeof(disable_cmd), disable_cmd);
 
     int smallest_key = my_key;
     char smallest_addr_full[18] = "(self)";
-
     pthread_mutex_lock(&detected_mutex);
     for (int i = 0; i < detected_count; i++) {
         if (detected_devices[i].key < smallest_key) {
@@ -334,13 +327,11 @@ void *scan_thread(void *arg) {
     pthread_mutex_unlock(&detected_mutex);
 
     if (strcmp(smallest_addr_full, "(self)") == 0) strncpy(smallest_addr_full, my_addr, 18);
-    
     char smallest_addr_last3[18];
-    // ★修正: 末尾2バイト（XX:XX, 5文字）を切り出す
     get_last_three(smallest_addr_full, smallest_addr_last3, 18); 
 
     if (smallest_key == my_key) printf("✅ I am candidate PARENT (key=%d)\n", my_key);
-    else printf("🔹 Parent candidate is %s (key=%d)\n", smallest_addr_full, smallest_key);
+    else printf("🔹 Parent candidate: %s (key=%d)\n", smallest_addr_full, smallest_key);
 
     pthread_mutex_lock(&parent_mutex);
     strncpy(perceived_parent_addr_last3, smallest_addr_last3, 18);
@@ -364,7 +355,6 @@ void *scan_thread(void *arg) {
 
         uint8_t reports = meta->data[0];
         uint8_t *offset = meta->data + 1;
-
         for (int i = 0; i < reports; i++) {
             le_advertising_info *info = (le_advertising_info *)offset;
             char addr[18]; ba2str(&info->bdaddr, addr);
@@ -379,7 +369,6 @@ void *scan_thread(void *arg) {
                 }
                 pos += f_len + 1;
             }
-
             char rep_parent[18] = "";
             extract_parent_tag_from_name(name, rep_parent, 18);
             if (rep_parent[0] != '\0') {
@@ -393,7 +382,6 @@ void *scan_thread(void *arg) {
                     strncpy(ver_list[ver_count].addr, addr, 18);
                     strncpy(ver_list[ver_count].rep_parent, rep_parent, 18);
                     ver_count++;
-                    printf("Parent-report from %s => %s\n", addr, rep_parent);
                 }
             }
             offset = (uint8_t *)info + sizeof(*info) + info->length;
@@ -401,7 +389,7 @@ void *scan_thread(void *arg) {
     }
 
     hci_send_cmd(scan_sock, OGF_LE_CTL, OCF_LE_SET_SCAN_ENABLE, sizeof(disable_cmd), disable_cmd);
-    close(scan_sock); // 受信ソケットを閉じる
+    close(scan_sock); 
 
     pthread_mutex_lock(&detected_mutex);
     int total = detected_count + 1;
@@ -409,32 +397,14 @@ void *scan_thread(void *arg) {
     
     printf("\nReceived reports from %d/%d devices.\n", ver_count, total-1);
     
-    // ★判定ロジック
     int all_match = 0;
-    
-    // 自分ひとりだけなら成功とみなす
     if (total == 1) {
         all_match = 1;
-        printf("[DEBUG] Only 1 node detected. Success assumed.\n");
     } else if (ver_count > 0) {
-        // 誰か一人でも見つけていて、意見が一致していれば成功とみなす（条件緩和）
         int match_count = 0;
-        
-        // デバッグ追加: 比較対象の文字列を出力して確認
-        printf("[DEBUG] --- Verification check --- \n");
-        printf("[DEBUG] Perceived Parent Last 2 Bytes: '%s'\n", perceived_parent_addr_last3);
-
         for(int i=0; i<ver_count; i++) {
-             // rep_parent は末尾2バイト（XX:XX形式）が格納されている想定
-             int is_match = (strcmp(ver_list[i].rep_parent, perceived_parent_addr_last3) == 0);
-             printf("[DEBUG] Report from %s: '%s' (Match=%s)\n", ver_list[i].addr, ver_list[i].rep_parent, is_match ? "YES" : "NO");
-
-             if(is_match) match_count++;
+             if(strcmp(ver_list[i].rep_parent, perceived_parent_addr_last3) == 0) match_count++;
         }
-        
-        printf("[DEBUG] ver_count=%d (reports received), match_count=%d (reports matching perceived parent).\n", ver_count, match_count);
-        
-        // ★条件緩和: 1人でも一致していればOKとする
         if (match_count > 0) all_match = 1; 
     }
 
@@ -446,13 +416,12 @@ void *scan_thread(void *arg) {
         printf("🎉 CONFIRMED Parent: %s\n", final_parent_addr_full);
     } else {
         final_success = 0;
-        printf("⚠️ Mismatch or missing reports.\n");
+        printf("⚠️ Election failed.\n");
     }
 
     pthread_mutex_lock(&parent_mutex);
     parent_phase = 0;
     pthread_mutex_unlock(&parent_mutex);
-
     return NULL;
 }
 
@@ -460,15 +429,12 @@ void *scan_thread(void *arg) {
 // ボタンスレッド
 // =========================
 void *button_thread(void *arg) {
-    printf("Button thread active on GPIO%d\n", PIN_BUTTON);
     int last = digitalRead(PIN_BUTTON);
-
     while (!get_start_flag()) {
         int val = digitalRead(PIN_BUTTON);
         if (last == 1 && val == 0) {
             delay(30);
             if (digitalRead(PIN_BUTTON) == 0) {
-                printf("[BUTTON] Pressed! Starting election.\n");
                 set_start_flag();
                 break;
             }
@@ -480,44 +446,28 @@ void *button_thread(void *arg) {
 }
 
 // =========================
-// メイン関数
+// main
 // =========================
 int main(int argc, char *argv[]) {
-    // ★リアルタイムログのための追加: stdoutのバッファリングを無効化する
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    // 1. GPIO初期化 (WiringPi)
-    if (wiringPiSetupGpio() < 0) {
-        perror("wiringPiSetupGpio failed");
-        return 1;
-    }
-    
-    // LEDとボタン設定
+    if (wiringPiSetupGpio() < 0) return 1;
     led_init(); 
     pinMode(PIN_BUTTON, INPUT);
     pullUpDnControl(PIN_BUTTON, PUD_UP);
 
-    // 2. Bluetooth初期化 (送信ソケット)
     dev_id = hci_get_route(NULL);
-    global_adv_sock = hci_open_dev(dev_id); // ★ここは送信専用にする
-    if (dev_id < 0 || global_adv_sock < 0) {
-        perror("Opening socket");
-        return 1;
-    }
+    global_adv_sock = hci_open_dev(dev_id); 
+    if (dev_id < 0 || global_adv_sock < 0) return 1;
 
     bdaddr_t bdaddr;
     hci_read_bd_addr(global_adv_sock, &bdaddr, 1000);
     ba2str(&bdaddr, my_addr);
     
-    // ----------------------------------------------
-    // キー生成をランダム化する修正
-    // 1. 乱数のシードを設定
     srand(time(NULL) ^ getpid()); 
-    // 2. キーをランダムな値で生成 (0から255の範囲)
     my_key = (rand() % 256); 
-    // ----------------------------------------------
 
-    printf("Starting... My addr=%s, key=%d (Random)\n", my_addr, my_key);
+    printf("Starting... Addr=%s, Key=%d\n", my_addr, my_key);
 
     pthread_t t_adv, t_scan, t_btn;
     pthread_create(&t_adv, NULL, advertise_thread, NULL);
@@ -526,37 +476,55 @@ int main(int argc, char *argv[]) {
 
     pthread_join(t_scan, NULL);
 
-    // 終了処理
     pthread_cancel(t_adv);
     pthread_cancel(t_btn);
     uint8_t d=0; 
     hci_send_cmd(global_adv_sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, 1, &d);
     close(global_adv_sock);
 
-    // 結果実行
+    // ★実行と結果判定
     if (final_success) {
-        led_set_green(); // 緑点灯
-        
+        printf("Election Success. Running main program...\n");
+        led_set_green(); // 実行中緑点灯
+
+        int sys_ret = 0;
+        char cmd[128]; 
+
         if (strcmp(final_parent_addr_full, my_addr) == 0) {
             printf("I am PARENT.\n");
-            char cmd[128]; 
+            
+            // ★ 親機になる場合、リストをファイルへ自動保存してから起動
+            save_device_list_for_parent("parent_key_list.txt");
+
             snprintf(cmd, sizeof(cmd), "./parent %s", final_parent_addr_full);
-            system(cmd);
+            sys_ret = system(cmd);
         } else {
-            // ★修正: ./child に親ノードのフルアドレスも引数として渡す
             printf("I am CHILD.\n");
-            char cmd[128]; 
             snprintf(cmd, sizeof(cmd), "./child %s %s", my_addr, final_parent_addr_full);
-            system(cmd);
+            sys_ret = system(cmd);
         }
-        
-        // 10秒待ってから消灯
-        sleep(10);
-        led_all_off();
+
+        int exit_code = 0;
+        if (WIFEXITED(sys_ret)) {
+            exit_code = WEXITSTATUS(sys_ret);
+        } else {
+            exit_code = -1; 
+        }
+
+        printf("Main program exit code: %d\n", exit_code);
+
+        if (exit_code == 0) {
+            printf("✅ SUCCESS: Green Blink x3\n");
+            led_blink(PIN_LED_GREEN, 300); 
+        } else {
+            printf("❌ FAILURE: Red Blink x3\n");
+            led_blink(PIN_LED_RED, 300);   
+        }
+        sleep(1); led_all_off(); 
+
     } else {
         printf("Election failed.\n");
-        led_set_blue(); // 失敗時は青に戻る
+        led_set_blue(); 
     }
-
     return 0;
 }
