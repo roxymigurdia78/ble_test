@@ -49,7 +49,7 @@ int current_song_id = 0;
 // 終了用ボタン
 #define PIN_EXIT_BUTTON 16
 
-const int SENSORS[] = {0, 5, 6, 26};
+const int SENSORS[] = {14, 15, 18, 23};
 #define NUM_SENSORS 4
 
 #define MY_COMPANY_ID 0xFFFF
