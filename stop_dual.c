@@ -33,7 +33,8 @@ int main(void) {
 
     printf("2. プロセス停止...\n");
     run_cmd("pkill -f button_dual");
-    // run_cmd("pkill -f led_control.py"); // Pythonはもう動いていないので削除
+    run_cmd("pkill -f effect_main");
+// run_cmd("pkill -f led_control.py"); // Pythonはもう動いていないので削除
 
     printf("3. Bluetooth停止...\n");
     run_cmd("hciconfig hci0 noleadv");
