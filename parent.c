@@ -55,7 +55,7 @@
 #define OPERATION_MODE_NDOF    0x0C
 #define EULER_UNIT             16.0f
 const char *OFFSET_FILE  = "bno055_heading_offset.txt";
-#define DIFF_THRESHOLD        0.020
+#define DIFF_THRESHOLD        0.010
 #define SECOND_MARGIN         0.0
 #define STABLE_COUNT_REQUIRED 10 // 10回連続検出で確定
 
@@ -783,7 +783,6 @@ hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, 1, &enable);
 }
 
 int main(int argc, char *argv[]) {
-setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <parent_full_address>\n", argv[0]);
 return 1;

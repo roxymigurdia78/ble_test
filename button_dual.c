@@ -500,6 +500,16 @@ int main(int argc, char *argv[]) {
             sys_ret = system(cmd);
         } else {
             printf("I am CHILD.\n");
+            
+            // --- 追加: 検知した台数(detected_count)を環境変数としてセット ---
+            // 自分(子機)から見ると「親機+もう1台の子機=2台」が見えているはずなので、
+            // detected_count は 2 となり、これが期待するサイクル数と一致します。
+            char count_str[16];
+            snprintf(count_str, sizeof(count_str), "%d", detected_count);
+            setenv("TOTAL_CHILD_NODES", count_str, 1); 
+            printf("[INFO] Set TOTAL_CHILD_NODES=%s for child process.\n", count_str);
+            // -------------------------------------------------------------
+
             snprintf(cmd, sizeof(cmd), "./child %s %s", my_addr, final_parent_addr_full);
             sys_ret = system(cmd);
         }

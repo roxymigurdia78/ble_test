@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /home/ras4/ble_test || exit 1
+cd /home/kaiji/ble_test || exit 1
 
 while true; do
     # 1. 前回の状態をクリーンアップ
