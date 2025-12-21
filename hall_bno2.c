@@ -22,7 +22,7 @@
 #define SPI_SPEED  1000000
 // チャンネル数を7に変更 (CH1からCH6を使用)
 #define NUM_CH      7
-#define THRESHOLD  0.020
+#define THRESHOLD  0.010
 #define BASELINE_SAMPLES 50
 
 // BNO055 定義
