@@ -445,7 +445,13 @@ int main(int argc, char *argv[]) {
             sys_ret = system(cmd);
         } else {
             printf("I am CHILD.\n");
-            snprintf(cmd, sizeof(cmd), "./child %s %s", my_addr, final_parent_addr_full);
+            // 検出数(=自分以外の全台数) は、(全ノード数 - 1) なので、
+            // 親機(1台)を除いた「子機の総数」と一致します。
+            // 環境変数 TOTAL_CHILD_NODES をセットして起動します。
+            snprintf(cmd, sizeof(cmd), "TOTAL_CHILD_NODES=%d ./child %s %s", 
+                     detected_count, my_addr, final_parent_addr_full);
+            
+            printf("[EXEC] %s\n", cmd); // デバッグ用: 実行コマンド表示
             sys_ret = system(cmd);
         }
         int exit_code = 0;

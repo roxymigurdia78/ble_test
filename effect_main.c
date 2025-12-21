@@ -34,7 +34,7 @@
 #define MAP_FILE "mapping.txt"
 #define HCI_DEV_ID 0
 
-// 現在の曲ID (0: DQ, 1: Star)
+// 現在の曲ID
 int current_song_id = 0; 
 
 // 停止コマンドID
@@ -116,7 +116,13 @@ int my_x = 0, my_y = 0, my_z = 0;
 
 static volatile int is_playing = 0;
 static unsigned long last_trigger_time = 0;
-static int last_handled_seq = -1;
+static char last_sender_mac[18] = {0};
+static int last_seq = -1;
+
+static volatile int led_fadeout = 0;   // 0:点灯中 / 1:消灯フェーズ
+static unsigned long music_end_time = 0;
+
+
 
 // ---------------------------------------------------------------------------
 // 高精度タイマー & ユーティリティ
@@ -143,6 +149,27 @@ static void sleep_us(unsigned long us) {
     req.tv_nsec = (us % 1000000) * 1000L;
     nanosleep(&req, NULL);
 }
+
+static pthread_mutex_t play_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static int try_start_playing(void) {
+    int ok = 0;
+    pthread_mutex_lock(&play_mtx);
+    if (!is_playing) {
+        is_playing = 1;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&play_mtx);
+    return ok;
+}
+
+static void stop_playing(void) {
+    pthread_mutex_lock(&play_mtx);
+    is_playing = 0;
+    pthread_mutex_unlock(&play_mtx);
+}
+
+
 
 static void try_set_realtime_priority() {
     struct sched_param p;
@@ -202,23 +229,51 @@ typedef struct { int hop; unsigned long start_time_ms; } LedArgs;
 
 void *led_thread_func(void *arg) {
     LedArgs *args = (LedArgs*)arg;
+    int hop = args->hop;
     unsigned long base_time = args->start_time_ms;
     free(arg);
 
+    float bpm = get_song_bpm(current_song_id);
+    if (bpm <= 0) bpm = 120.0f;
+    unsigned long beat_ms = (unsigned long)(60000.0f / bpm);
+
     while (is_playing) {
         unsigned long now = get_time_ms();
-        unsigned long elapsed = now - base_time;
-        float progress = (float)(elapsed % GRADATION_SPEED_MS) / GRADATION_SPEED_MS;
-        float hue = progress * 360.0f;
-        int r, g, b;
-        hsv_to_rgb(hue, 1.0f, 1.0f, &r, &g, &b);
-        set_led_color(r, g, b);
-        sleep_ms(16); 
+        long elapsed = (long)(now - base_time);
+
+        // 音開始前は必ず消灯
+        if (elapsed < 0) {
+            set_led_color(0, 0, 0);
+            sleep_ms(5);
+            continue;
+        }
+
+        // 現在の拍数
+        int beat = elapsed / beat_ms;
+        int max_hop = beat;
+
+        if (hop <= max_hop) {
+            // 拍 × hop による色変化（旧ロジック）
+            float hue = fmodf((beat * 30.0f) + (hop * 30.0f), 360.0f);
+            int r, g, b;
+            hsv_to_rgb(hue, 1.0f, 1.0f, &r, &g, &b);
+            set_led_color(r, g, b);
+        } else {
+            // 波がまだ到達していない
+            set_led_color(0, 0, 0);
+        }
+
+        sleep_ms(10);
     }
-    // 終了時は消灯
-    set_led_color(0,0,0);
+
+    // 再生終了時は消灯
+    set_led_color(0, 0, 0);
     return NULL;
 }
+
+
+
+
 
 static void play_note_for_us(int freq, unsigned long usec) {
     if (freq > 0) {
@@ -311,16 +366,20 @@ void *scheduled_play_thread(void *arg) {
     }
 
     if (is_playing) return NULL;
-    is_playing = 1;
+    if (!try_start_playing()) return NULL;
 
     int max_parts = get_part_count(current_song_id);
     if (max_parts <= 0) max_parts = 1;   // 念のための保険
 
-    int dynamic_part_id = (dist % max_parts) + 1;
+    int dynamic_part_id = 1;
+
+    if (CURRENT_PRIORITY && CURRENT_PRIORITY_LEN > 0) {
+        dynamic_part_id = CURRENT_PRIORITY[ my_rank % CURRENT_PRIORITY_LEN ];
+    }
 
     Note *score = get_music_part(current_song_id, dynamic_part_id);
     if (!score) {
-        is_playing = 0; 
+        stop_playing();
         return NULL;
     }
 
@@ -329,7 +388,7 @@ void *scheduled_play_thread(void *arg) {
     pthread_t th_led;
     LedArgs *la = malloc(sizeof(LedArgs));
     la->hop = dist; 
-    la->start_time_ms = get_time_ms();
+    la->start_time_ms = target; 
     pthread_create(&th_led, NULL, led_thread_func, la);
     pthread_detach(th_led);
 
@@ -348,7 +407,7 @@ void *scheduled_play_thread(void *arg) {
     }
     softToneWrite(PIN_SPK, 0);
     sleep_ms(500);
-    is_playing = 0;
+    stop_playing();
     // 音楽スレッド終了時に念のため消灯
     set_led_color(0,0,0);
     return NULL;
@@ -409,8 +468,7 @@ void determine_role_from_map() {
 // ---------------------------------------------------------------------------
 void cleanup_and_exit(int sig) {
     printf("\n[SYSTEM] Shutting down...\n");
-    is_playing = 0; 
-    
+    stop_playing();
     // ★★★ 重要: PWM消灯 + 待機 + 強制LOW ★★★
     // 1. まずPWMで消灯命令
     softPwmWrite(PIN_LED_R, 0); 
@@ -499,10 +557,10 @@ int main() {
 
         if (is_triggered) {
             if (is_playing) { sleep_ms(100); continue; }
-            sleep_ms(rand() % 50);
+            sleep_ms(my_rank * 5);
 
-            static int global_seq = 1;
-            global_seq = (global_seq % 100) + 1;
+            static uint8_t local_seq = 0;
+            uint16_t global_seq = ((my_rank & 0xFF) << 8) | (++local_seq);
             last_trigger_time = get_time_ms();
             int chosen_song = rand() % SONG_COUNT;
             select_priority_for_song(chosen_song);
@@ -520,8 +578,6 @@ int main() {
             sch->ox = my_x; sch->oy = my_y; sch->oz = my_z;
             pthread_t th_play; pthread_create(&th_play, NULL, scheduled_play_thread, sch);
             pthread_detach(th_play);
-
-            last_handled_seq = global_seq;
 
             if (trigger_pin != 999) {
                 int cnt=0; while (digitalRead(trigger_pin) == HIGH && cnt<50) { sleep_ms(100); cnt++; }
@@ -565,9 +621,13 @@ int main() {
                             int rcv_song_id = payload->song_id;
                             int ox = payload->origin_x; int oy = payload->origin_y; int oz = payload->origin_z;
 
-                            if (seq == last_handled_seq) { offset += dlen + 1; continue; }
+                            if (seq == last_seq && strcasecmp(sender_mac, last_sender_mac) == 0) {
+                                offset += dlen + 1;
+                                continue;
+                            }
+                            strcpy(last_sender_mac, sender_mac);
+                            last_seq = seq;
 
-                            last_handled_seq = seq;
                             select_priority_for_song(rcv_song_id);
                             int dist = abs(my_x - ox) + abs(my_y - oy) + abs(my_z - oz);
                             int estimated_hop_delay = dist * 10; 

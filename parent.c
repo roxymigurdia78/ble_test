@@ -772,7 +772,7 @@ len += name_len;
     enable = 0x01;
 hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, 1, &enable);
 
-    printf("[COMM] MAP END advertising start (10 seconds)..."); sleep(10);
+    printf("[COMM] MAP END advertising start (5 seconds)..."); sleep(5);
 
     enable = 0x00;
 hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, 1, &enable);
@@ -783,6 +783,7 @@ hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, 1, &enable);
 }
 
 int main(int argc, char *argv[]) {
+    setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <parent_full_address>\n", argv[0]);
 return 1;
@@ -813,12 +814,15 @@ return 2;
         fprintf(stderr, "ERROR: Heading offset file not loaded. Aborting.\n");
 close(i2c_fd); return 1;
     }
-
+ pthread_t rx_thread, sensor_th, mag_thread;
+    pthread_create(&rx_thread, NULL, BLE_receive_data_server, NULL);
+    pthread_create(&sensor_th, NULL, parent_sensor_monitor, NULL);
     printf("Parent Baseline sampling...\n");
 for (int s = 0; s < BASELINE_SAMPLES; s++) {
         for (int ch = 1; ch < NUM_CH; ch++) g_baseline[ch] += read_adc_voltage(ch);
 usleep(100000);
     }
+
     // ★ 修正: BASELIME_SAMPLES -> BASELINE_SAMPLES に修正
     for (int ch = 1; ch < NUM_CH; ch++) g_baseline[ch] /= BASELINE_SAMPLES; 
 int loaded = load_key_list(KEY_LIST_FILE);
@@ -831,9 +835,6 @@ g_ready_count = 0; g_total_children = 0;
 }
     }
 
-    pthread_t rx_thread, sensor_th, mag_thread;
-    pthread_create(&rx_thread, NULL, BLE_receive_data_server, NULL);
-    pthread_create(&sensor_th, NULL, parent_sensor_monitor, NULL);
 int map_result = 1;
     if (loaded > 0) {
         pthread_create(&mag_thread, NULL, mag_sequence_thread, NULL);

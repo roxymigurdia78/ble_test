@@ -73,7 +73,7 @@ static ChildMapEntry g_child_map[CHILD_MAX_MAP];
 #define SPI_CH      0
 #define SPI_SPEED   1000000
 #define NUM_CH      7
-#define DIFF_THRESHOLD        0.050 
+#define DIFF_THRESHOLD        0.010 
 #define STABLE_COUNT_REQUIRED 10 
 #define BASELINE_SAMPLES      50
 
@@ -793,6 +793,7 @@ end_tx_phase:; // goto のターゲット
 // ==========================================================
 int main(int argc, char *argv[])
 {
+    setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 3) {
         fprintf(stderr,
                 "Usage: ./child <my_full_address> <parent_full_address>\n");
@@ -951,6 +952,8 @@ g_scan_phase = 1;
         BLE_scan_for_targets(g_my_addr, 50, g_scan_phase); 
         usleep(50000);
 }
+printf("[SYNC] MAP_END受信。終了タイミングを合わせるため5秒待機します...\n");
+    sleep(5);
     
     printf("\n\n===== マッピング終了通知(MAP_END)を受信しました。子機プログラムを終了します。 =====\n");
     child_dump_map_summary(parent_addr);
