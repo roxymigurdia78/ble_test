@@ -49,7 +49,7 @@ int current_song_id = 0;
 // 終了用ボタン
 #define PIN_EXIT_BUTTON 16
 
-const int SENSORS[] = {14,15,18, 23};
+const int SENSORS[] = {14, 15, 18, 23};
 #define NUM_SENSORS 4
 
 #define MY_COMPANY_ID 0xFFFF
@@ -85,13 +85,25 @@ static const int *CURRENT_PRIORITY = NULL;
 static int CURRENT_PRIORITY_LEN = 0;
 
 void select_priority_for_song(int song_id) {
-    current_song_id = song_id; 
+    current_song_id = song_id;
+
     if (song_id == 0) {
         CURRENT_PRIORITY = PART_PRIORITY_SONG0;
         CURRENT_PRIORITY_LEN = PRIORITY_LEN_SONG0;
-    } else {
+    } else if (song_id == 1) {
         CURRENT_PRIORITY = PART_PRIORITY_SONG1;
         CURRENT_PRIORITY_LEN = PRIORITY_LEN_SONG1;
+    } else if (song_id == 2) {
+        CURRENT_PRIORITY = PART_PRIORITY_SONG0;     
+        CURRENT_PRIORITY_LEN = 6;
+    } else if (song_id == 3) {
+        CURRENT_PRIORITY = PART_PRIORITY_SONG0;    
+        CURRENT_PRIORITY_LEN = 6;
+    } else {
+        // 不正ID保険
+        CURRENT_PRIORITY = PART_PRIORITY_SONG0;
+        CURRENT_PRIORITY_LEN = 6;
+        current_song_id = 0;
     }
 }
 
@@ -301,8 +313,10 @@ void *scheduled_play_thread(void *arg) {
     if (is_playing) return NULL;
     is_playing = 1;
 
-    int max_parts = (current_song_id == 0) ? 6 : 7;
-    int dynamic_part_id = (dist % max_parts) + 1; 
+    int max_parts = get_part_count(current_song_id);
+    if (max_parts <= 0) max_parts = 1;   // 念のための保険
+
+    int dynamic_part_id = (dist % max_parts) + 1;
 
     Note *score = get_music_part(current_song_id, dynamic_part_id);
     if (!score) {
@@ -490,7 +504,7 @@ int main() {
             static int global_seq = 1;
             global_seq = (global_seq % 100) + 1;
             last_trigger_time = get_time_ms();
-            int chosen_song = rand() % 2;
+            int chosen_song = rand() % SONG_COUNT;
             select_priority_for_song(chosen_song);
 
             printf("\n[TRIGGER] Origin! Song:%d Coords:(%d, %d, %d) Seq:%d\n", chosen_song, my_x, my_y, my_z, global_seq);
