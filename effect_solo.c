@@ -24,7 +24,7 @@
 #define PIN_EXIT_BUTTON 16
 
 // センサピン (4つ使用)
-const int SENSORS[] = {0, 5, 6, 26};
+const int SENSORS[] = {14, 15, 18, 23};
 #define NUM_SENSORS 4
 
 // --- グローバル変数 ---
@@ -229,7 +229,7 @@ int main() {
 
         if (is_triggered) {
             last_trigger_time = get_time_ms();
-            int song_id = rand() % 2;
+            int song_id = rand() % 4;
             play_music(song_id);
             sleep_ms(1000);
         }

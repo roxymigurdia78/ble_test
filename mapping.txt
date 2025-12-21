@@ -1,7 +1,7 @@
 # Cube Mapping Log
 
 # Final Cube Coordinates
-[DC:A6:32:9A:8D:D1] Key: 36, Coords: (0, 0, 0)
-[DC:A6:32:9A:78:50] Key: 242, Coords: (-1, 0, 0)
+[DC:A6:32:9A:77:C0] Key: 164, Coords: (0, 0, 0)
+[DC:A6:32:9A:77:F3] Key: 184, Coords: (-1, -1, -1)
 
 # Raw Reports
