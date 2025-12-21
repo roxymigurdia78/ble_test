@@ -783,6 +783,7 @@ hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, 1, &enable);
 }
 
 int main(int argc, char *argv[]) {
+setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <parent_full_address>\n", argv[0]);
 return 1;

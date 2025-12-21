@@ -793,6 +793,7 @@ end_tx_phase:; // goto のターゲット
 // ==========================================================
 int main(int argc, char *argv[])
 {
+setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 3) {
         fprintf(stderr,
                 "Usage: ./child <my_full_address> <parent_full_address>\n");
