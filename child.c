@@ -73,7 +73,7 @@ static ChildMapEntry g_child_map[CHILD_MAX_MAP];
 #define SPI_CH      0
 #define SPI_SPEED   1000000
 #define NUM_CH      7
-#define DIFF_THRESHOLD        0.050 
+#define DIFF_THRESHOLD        0.010 
 #define STABLE_COUNT_REQUIRED 10 
 #define BASELINE_SAMPLES      50
 
