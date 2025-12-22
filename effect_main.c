@@ -254,7 +254,9 @@ void *led_thread_func(void *arg) {
 
         if (hop <= max_hop) {
             // 拍 × hop による色変化（旧ロジック）
-            float hue = fmodf((beat * 30.0f) + (hop * 30.0f), 360.0f);
+            float hue = fmodf((beat * 30.0f) - (hop * 30.0f), 360.0f);
+            if (hue < 0) hue += 360.0f;
+            
             int r, g, b;
             hsv_to_rgb(hue, 1.0f, 1.0f, &r, &g, &b);
             set_led_color(r, g, b);
