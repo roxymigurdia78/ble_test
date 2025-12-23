@@ -1,4 +1,11 @@
-// parent.c (回転対応: hall_bno2方式 / キャリブ復元対応 / CH3<->CH5 入替 / 他機能は維持)
+// parent.c (回転対応: hall_bno2方式 / キャリブ復元対応 / CH3<->CH5 入替 / 他機能は維持
+//         + マッピング改良: 親機からの相対座標が +1以上 / -1以下 も確実に表示・送信(MKフレーム改良)
+//
+// build:
+//   gcc -o parent parent.c -lwiringPi -lpthread -lbluetooth -lm
+//
+// run:
+//   sudo ./parent <parent_full_address>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +47,28 @@
 #define C_ACT_TIME_SEC   20
 #define C_TX_TIME_SEC    10
 #define COOLDOWN_SEC      5
+
+// ==========================================================
+// BlueZ互換マクロ（古い環境のための保険）
+// ==========================================================
+#ifndef OGF_LE_CTL
+#define OGF_LE_CTL 0x08
+#endif
+#ifndef OCF_LE_SET_SCAN_PARAMETERS
+#define OCF_LE_SET_SCAN_PARAMETERS 0x000B
+#endif
+#ifndef OCF_LE_SET_SCAN_ENABLE
+#define OCF_LE_SET_SCAN_ENABLE 0x000C
+#endif
+#ifndef OCF_LE_SET_ADVERTISING_PARAMETERS
+#define OCF_LE_SET_ADVERTISING_PARAMETERS 0x0006
+#endif
+#ifndef OCF_LE_SET_ADVERTISING_DATA
+#define OCF_LE_SET_ADVERTISING_DATA 0x0008
+#endif
+#ifndef OCF_LE_SET_ADVERTISE_ENABLE
+#define OCF_LE_SET_ADVERTISE_ENABLE 0x000A
+#endif
 
 // ==========================================================
 // センサー関連 定義とグローバル変数
@@ -520,9 +549,15 @@ void *BLE_receive_data_server(void *arg) {
 
             char name[128] = "";
             int pos = 0;
+
+            // AD構造を安全に走査
             while (pos < info->length) {
                 uint8_t field_len = info->data[pos];
-                if (field_len == 0 || pos + field_len >= info->length) break;
+                if (field_len == 0) break;
+
+                // 1 byte(length) + field_len bytes が必要
+                if (pos + 1 + field_len > info->length) break;
+
                 uint8_t field_type = info->data[pos + 1];
                 if (field_type == 0x09 || field_type == 0x08) {
                     int name_len = field_len - 1;
@@ -536,7 +571,7 @@ void *BLE_receive_data_server(void *arg) {
             if (name[0] != '\0') {
                 char *p = strstr(name, "SURFACE:");
                 if (p) {
-                    p += strlen("SURFACE:");
+                    p += (int)strlen("SURFACE:");
                     char surface[32];
                     int si = 0;
                     while (*p != '\0' && *p != '|' && si < 31) surface[si++] = *p++;
@@ -549,7 +584,8 @@ void *BLE_receive_data_server(void *arg) {
                 if (strncmp(name, "READY", 5) == 0) register_child_ready(addr);
             }
 
-            offset = (uint8_t *)info + sizeof(*info) + info->length;
+            // ★重要：RSSI(1byte)分 +1 進める（これが無いと複数reportで崩れる）
+            offset = (uint8_t *)info + sizeof(*info) + info->length + 1;
         }
     }
 
@@ -626,7 +662,7 @@ void *mag_sequence_thread(void *arg) {
 
     le_set_advertising_parameters_cp adv_params_cp;
     memset(&adv_params_cp, 0, sizeof(adv_params_cp));
-    uint16_t interval = (uint16_t)(500 * 1.6);
+    uint16_t interval = (uint16_t)(500 * 1.6); // 500ms
     adv_params_cp.min_interval = htobs(interval);
     adv_params_cp.max_interval = htobs(interval);
     adv_params_cp.advtype = 0x00;
@@ -671,22 +707,24 @@ void *mag_sequence_thread(void *arg) {
         printf("\n[PHASE START] 子機(Key=%d) MT通知フェーズ (C-MT) (%d秒)\n", key, C_MT_TIME_SEC);
         uint8_t adv_data[31];
         memset(adv_data, 0, sizeof(adv_data));
-        int len = 0;
+        int adlen = 0;
 
-        adv_data[len++] = 2; adv_data[len++] = 0x01; adv_data[len++] = 0x06;
+        adv_data[adlen++] = 2; adv_data[adlen++] = 0x01; adv_data[adlen++] = 0x06;
 
         char name_field[32];
         snprintf(name_field, sizeof(name_field), "MT:%s", target_addr);
         int name_len = (int)strlen(name_field); if (name_len > 26) name_len = 26;
-        adv_data[len++] = (uint8_t)(name_len + 1);
-        adv_data[len++] = 0x09;
-        memcpy(&adv_data[len], name_field, name_len); len += name_len;
+        adv_data[adlen++] = (uint8_t)(name_len + 1);
+        adv_data[adlen++] = 0x09;
+        memcpy(&adv_data[adlen], name_field, name_len); adlen += name_len;
 
         struct { uint8_t length; uint8_t data[31]; } __attribute__((packed)) adv_cp;
-        adv_cp.length = (uint8_t)len;
-        memcpy(adv_cp.data, adv_data, len);
+        memset(&adv_cp, 0, sizeof(adv_cp));
+        adv_cp.length = (uint8_t)adlen;
+        memcpy(adv_cp.data, adv_data, adlen);
 
-        hci_send_cmd(sock_adv, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_DATA, len + 1, &adv_cp);
+        // ★本来は32バイトパラメータ想定なので sizeof(adv_cp) を渡す（短いlenだと環境で不安定になることがある）
+        hci_send_cmd(sock_adv, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_DATA, sizeof(adv_cp), &adv_cp);
         uint8_t enable = 0x01;
         hci_send_cmd(sock_adv, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, 1, &enable);
 
@@ -727,7 +765,7 @@ void *mag_sequence_thread(void *arg) {
 }
 
 // ==========================================================
-// coordinate_mapping / BLE_send_map_result（元ロジック維持）
+// coordinate_mapping / BLE_send_map_result（元ロジック維持 + MKフレーム改良）
 // ==========================================================
 int coordinate_mapping(void) {
     printf("\n\n===== マッピング処理開始 =====\n");
@@ -776,12 +814,12 @@ int coordinate_mapping(void) {
                         int nx = cx, ny = cy, nz = cz;
 
                         // 座標決定ロジック（元のまま）
-                        if (strcmp(surf, "FRONT") == 0)      ny -= 1;
-                        else if (strcmp(surf, "BACK") == 0)  ny += 1;
-                        else if (strcmp(surf, "LEFT") == 0)  nx += 1;
-                        else if (strcmp(surf, "RIGHT") == 0) nx -= 1;
-                        else if (strcmp(surf, "TOP") == 0)   nz -= 1;
-                        else if (strcmp(surf, "BOTTOM") == 0)nz += 1;
+                        if (strcmp(surf, "FRONT") == 0)       ny -= 1;
+                        else if (strcmp(surf, "BACK") == 0)   ny += 1;
+                        else if (strcmp(surf, "LEFT") == 0)   nx += 1;
+                        else if (strcmp(surf, "RIGHT") == 0)  nx -= 1;
+                        else if (strcmp(surf, "TOP") == 0)    nz -= 1;
+                        else if (strcmp(surf, "BOTTOM") == 0) nz += 1;
 
                         g_nodes[det_idx].x = nx; g_nodes[det_idx].y = ny; g_nodes[det_idx].z = nz;
                         new_mapped++; mapped_count++;
@@ -854,7 +892,7 @@ int BLE_send_map_result(int map_result) {
 
     le_set_advertising_parameters_cp adv_params_cp;
     memset(&adv_params_cp, 0, sizeof(adv_params_cp));
-    uint16_t interval = (uint16_t)(100 * 1.6);
+    uint16_t interval = (uint16_t)(100 * 1.6); // 100ms
     adv_params_cp.min_interval = htobs(interval);
     adv_params_cp.max_interval = htobs(interval);
     adv_params_cp.advtype = 0x00;
@@ -868,24 +906,28 @@ int BLE_send_map_result(int map_result) {
     for (int i = 0; i < g_node_count; i++) {
         int key = g_nodes[i].key;
         int x = g_nodes[i].x, y = g_nodes[i].y, z = g_nodes[i].z;
-        char addr_hex[13];
-        compress_addr_to_hex12(g_nodes[i].addr, addr_hex, sizeof(addr_hex));
-        char name_field[32];
-        snprintf(name_field, sizeof(name_field), "MK:%d:%s:%d,%d,%d", key, addr_hex, x, y, z);
 
-        int len = 0;
+        // ★改良点：
+        // 旧: MK:key:addrhex:x,y,z は 26文字制限で座標が欠けやすい
+        // 新: MK:key:x,y,z にして “-1や2以上” を確実に載せる
+        char name_field[32];
+        snprintf(name_field, sizeof(name_field), "MK:%d:%d,%d,%d", key, x, y, z);
+
+        int adlen = 0;
         memset(adv_data, 0, sizeof(adv_data));
-        adv_data[len++] = 2; adv_data[len++] = 0x01; adv_data[len++] = 0x06;
+        adv_data[adlen++] = 2; adv_data[adlen++] = 0x01; adv_data[adlen++] = 0x06;
 
         int name_len = (int)strlen(name_field);
         if (name_len > 26) name_len = 26;
-        adv_data[len++] = (uint8_t)(name_len + 1);
-        adv_data[len++] = 0x09;
-        memcpy(&adv_data[len], name_field, name_len); len += name_len;
+        adv_data[adlen++] = (uint8_t)(name_len + 1);
+        adv_data[adlen++] = 0x09;
+        memcpy(&adv_data[adlen], name_field, name_len); adlen += name_len;
 
-        adv_cp.length = (uint8_t)len;
-        memcpy(adv_cp.data, adv_data, len);
-        hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_DATA, len + 1, &adv_cp);
+        memset(&adv_cp, 0, sizeof(adv_cp));
+        adv_cp.length = (uint8_t)adlen;
+        memcpy(adv_cp.data, adv_data, adlen);
+
+        hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_DATA, sizeof(adv_cp), &adv_cp);
 
         enable = 0x01;
         hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, 1, &enable);
@@ -900,20 +942,21 @@ int BLE_send_map_result(int map_result) {
     char end_field[32];
     snprintf(end_field, sizeof(end_field), "MAP_END:%s", map_result == 0 ? "SUCCESS" : "FAILURE");
 
-    int len = 0;
+    int adlen = 0;
     memset(adv_data, 0, sizeof(adv_data));
-    adv_data[len++] = 2; adv_data[len++] = 0x01; adv_data[len++] = 0x06;
+    adv_data[adlen++] = 2; adv_data[adlen++] = 0x01; adv_data[adlen++] = 0x06;
 
     int name_len = (int)strlen(end_field);
     if (name_len > 26) name_len = 26;
-    adv_data[len++] = (uint8_t)(name_len + 1);
-    adv_data[len++] = 0x09;
-    memcpy(&adv_data[len], end_field, name_len); len += name_len;
+    adv_data[adlen++] = (uint8_t)(name_len + 1);
+    adv_data[adlen++] = 0x09;
+    memcpy(&adv_data[adlen], end_field, name_len); adlen += name_len;
 
-    adv_cp.length = (uint8_t)len;
-    memcpy(adv_cp.data, adv_data, len);
+    memset(&adv_cp, 0, sizeof(adv_cp));
+    adv_cp.length = (uint8_t)adlen;
+    memcpy(adv_cp.data, adv_data, adlen);
 
-    hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_DATA, len + 1, &adv_cp);
+    hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISING_DATA, sizeof(adv_cp), &adv_cp);
     enable = 0x01;
     hci_send_cmd(sock, OGF_LE_CTL, OCF_LE_SET_ADVERTISE_ENABLE, 1, &enable);
 
@@ -1001,6 +1044,7 @@ int main(int argc, char *argv[]) {
         map_result = 1;
     }
 
+    // ★ここで送るMKフレームは “-1や2以上” を確実に載せられる形式に変更済み
     BLE_send_map_result(map_result);
 
     gpio_off_and_unexport();
