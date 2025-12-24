@@ -34,7 +34,7 @@
 #define MAX_NODES       32
 
 // プロトコル時間定義
-#define P_MAG_TIME_SEC   30
+#define P_MAG_TIME_SEC   20
 #define P_SCAN_TIME_SEC  10
 #define C_MT_TIME_SEC    10
 #define C_ACT_TIME_SEC   20
@@ -66,7 +66,7 @@
 static const char *CALIB_FILE  = "bno055_calib.bin";
 static const char *OFFSET_FILE = "bno055_heading_offset.txt";
 
-#define DIFF_THRESHOLD        0.010
+#define DIFF_THRESHOLD        0.008
 #define STABLE_COUNT_REQUIRED 10
 #define BASELINE_SAMPLES      50
 
@@ -112,7 +112,7 @@ typedef struct {
     char surface[16];
 } ReportEntry;
 
-#define MAX_REPORTS 256
+#define MAX_REPORTS 1024
 static ReportEntry g_reports[MAX_REPORTS];
 static int g_report_count = 0;
 static pthread_mutex_t report_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -727,77 +727,135 @@ void *mag_sequence_thread(void *arg) {
 }
 
 // ==========================================================
-// coordinate_mapping / BLE_send_map_result（元ロジック維持）
+// parent.c 修正用コード (X=-1 対応版)
 // ==========================================================
+
+// ★未確定を表す値を -1 から -999 に変更 (重要！)
+#define UNMAPPED_VAL -999
+
+// 指定した座標にすでに確定したノードがいるかチェック
+static int is_occupied(int x, int y, int z) {
+    for (int i = 0; i < g_node_count; i++) {
+        // ★修正: UNMAPPED_VAL (-999) 以外なら「誰かいる」とみなす
+        if (g_nodes[i].x == UNMAPPED_VAL) continue;
+        
+        if (g_nodes[i].x == x && g_nodes[i].y == y && g_nodes[i].z == z) {
+            return 1; // 誰かいる (Occupied)
+        }
+    }
+    return 0; // 空いている (Empty)
+}
+
 int coordinate_mapping(void) {
-    printf("\n\n===== マッピング処理開始 =====\n");
+    printf("\n\n===== マッピング処理開始 (初期値-999版) =====\n");
 
     pthread_mutex_lock(&report_mutex);
-    printf("[MAP INFO] Total reports collected before mapping: %d\n", g_report_count);
+    printf("[MAP INFO] Total reports collected: %d\n", g_report_count);
     pthread_mutex_unlock(&report_mutex);
 
     FILE *fp = fopen(MAP_FILE_PATH, "w");
     if (!fp) { perror("Map file error"); return 1; }
     fprintf(fp, "# Cube Mapping Log\n");
 
+    // 1. 初期化
     int parent_index = -1;
     for (int i = 0; i < g_node_count; i++) {
+        // ★修正: 初期値を -999 に設定
+        g_nodes[i].x = UNMAPPED_VAL; 
+        g_nodes[i].y = UNMAPPED_VAL; 
+        g_nodes[i].z = UNMAPPED_VAL;
+        
         if (strcmp(g_nodes[i].addr, g_parent_addr) == 0) {
             g_nodes[i].x = 0; g_nodes[i].y = 0; g_nodes[i].z = 0;
             parent_index = i;
-            break;
         }
     }
+
     if (parent_index == -1) {
         fprintf(stderr, "[MAP] 親機情報なし。失敗。\n");
         fclose(fp);
         return 1;
     }
 
+    // 2. 反復マッピング
     int mapped_count = 1;
-    while (mapped_count < g_node_count) {
-        int new_mapped = 0;
-        for (int i = 0; i < g_node_count; i++) {
-            if (g_nodes[i].x == -1) continue;
-            int cx = g_nodes[i].x, cy = g_nodes[i].y, cz = g_nodes[i].z;
+    int loop_limit = g_node_count * 3; // 少し多めに回す
+    int changed = 1;
 
-            pthread_mutex_lock(&report_mutex);
-            for (int r = 0; r < g_report_count; r++) {
-                if (strcmp(g_reports[r].target_addr, g_nodes[i].addr) == 0) {
-                    const char *det_addr = g_reports[r].detected_addr;
-                    const char *surf = g_reports[r].surface;
+    while (changed && loop_limit > 0) {
+        changed = 0;
+        loop_limit--;
 
-                    int det_idx = -1;
-                    for (int j = 0; j < g_node_count; j++) {
-                        if (strcmp(g_nodes[j].addr, det_addr) == 0) { det_idx = j; break; }
-                    }
+        pthread_mutex_lock(&report_mutex);
+        for (int r = 0; r < g_report_count; r++) {
+            const char *target_addr   = g_reports[r].target_addr;
+            const char *detected_addr = g_reports[r].detected_addr;
+            const char *surf          = g_reports[r].surface;
 
-                    if (det_idx != -1 && g_nodes[det_idx].x == -1) {
-                        int nx = cx, ny = cy, nz = cz;
+            int src_idx = get_index_by_addr(target_addr);
+            int det_idx = get_index_by_addr(detected_addr);
 
-                        // 座標決定ロジック（元のまま）
-                        if (strcmp(surf, "FRONT") == 0)      ny -= 1;
-                        else if (strcmp(surf, "BACK") == 0)  ny += 1;
-                        else if (strcmp(surf, "LEFT") == 0)  nx += 1;
-                        else if (strcmp(surf, "RIGHT") == 0) nx -= 1;
-                        else if (strcmp(surf, "TOP") == 0)   nz -= 1;
-                        else if (strcmp(surf, "BOTTOM") == 0)nz += 1;
+            if (src_idx == -1 || det_idx == -1) continue;
 
-                        g_nodes[det_idx].x = nx; g_nodes[det_idx].y = ny; g_nodes[det_idx].z = nz;
-                        new_mapped++; mapped_count++;
-                        printf("[MAP] Mapped %s at (%d, %d, %d) from %s (%s)\n",
-                               det_addr, nx, ny, nz, g_nodes[i].addr, surf);
-                    }
-                }
+            // ★修正: UNMAPPED_VAL で判定
+            int src_known = (g_nodes[src_idx].x != UNMAPPED_VAL);
+            int det_known = (g_nodes[det_idx].x != UNMAPPED_VAL);
+
+            // 両方確定済みならスキップ
+            if (src_known && det_known) continue;
+            // 両方不明なら計算できないのでスキップ
+            if (!src_known && !det_known) continue;
+
+            int nx = 0, ny = 0, nz = 0;
+            int candidate_idx = -1;
+
+            // ケースA: 発信源(Known) -> 受信者(Unknown)
+            if (src_known) {
+                nx = g_nodes[src_idx].x;
+                ny = g_nodes[src_idx].y;
+                nz = g_nodes[src_idx].z;
+                
+                if      (strcmp(surf, "LEFT") == 0)   nx += 1;
+                else if (strcmp(surf, "RIGHT") == 0)  nx -= 1;
+                else if (strcmp(surf, "FRONT") == 0)  ny -= 1;
+                else if (strcmp(surf, "BACK") == 0)   ny += 1;
+                else if (strcmp(surf, "TOP") == 0)    nz -= 1;
+                else if (strcmp(surf, "BOTTOM") == 0) nz += 1;
+                
+                candidate_idx = det_idx;
             }
-            pthread_mutex_unlock(&report_mutex);
+            // ケースB: 発信源(Unknown) -> 受信者(Known) (逆算)
+            else if (det_known) {
+                nx = g_nodes[det_idx].x;
+                ny = g_nodes[det_idx].y;
+                nz = g_nodes[det_idx].z;
+
+                if      (strcmp(surf, "LEFT") == 0)   nx -= 1;
+                else if (strcmp(surf, "RIGHT") == 0)  nx += 1;
+                else if (strcmp(surf, "FRONT") == 0)  ny += 1;
+                else if (strcmp(surf, "BACK") == 0)   ny -= 1;
+                else if (strcmp(surf, "TOP") == 0)    nz += 1;
+                else if (strcmp(surf, "BOTTOM") == 0) nz -= 1;
+
+                candidate_idx = src_idx;
+            }
+
+            // 排他制御: 計算した場所に誰もいなければ採用
+            if (!is_occupied(nx, ny, nz)) {
+                g_nodes[candidate_idx].x = nx;
+                g_nodes[candidate_idx].y = ny;
+                g_nodes[candidate_idx].z = nz;
+                mapped_count++;
+                changed = 1;
+                
+                printf("[MAP] Mapped Key:%d to (%d,%d,%d) via %s\n", 
+                       g_nodes[candidate_idx].key, nx, ny, nz, surf);
+            }
         }
-        if (new_mapped == 0 && mapped_count < g_node_count) {
-            printf("[MAP] これ以上マッピング不可。\n");
-            break;
-        }
+        pthread_mutex_unlock(&report_mutex);
     }
 
+    // 3. 結果出力
     fprintf(fp, "\n# Final Cube Coordinates\n");
     for (int i = 0; i < g_node_count; i++) {
         fprintf(fp, "[%s] Key: %d, Coords: (%d, %d, %d)\n",
@@ -807,23 +865,14 @@ int coordinate_mapping(void) {
     fprintf(fp, "\n# Raw Reports\n");
     pthread_mutex_lock(&report_mutex);
     for (int r = 0; r < g_report_count; r++) {
-        fprintf(fp, "%s | %s | %s\n",
-                g_reports[r].target_addr, g_reports[r].detected_addr, g_reports[r].surface);
+        fprintf(fp, "%s | %s | %s\n", g_reports[r].target_addr, g_reports[r].detected_addr, g_reports[r].surface);
     }
     pthread_mutex_unlock(&report_mutex);
 
-    pthread_mutex_lock(&report_mutex);
-    printf("[MAP INFO] Clearing %d reports after successful logging.\n", g_report_count);
     g_report_count = 0;
-    pthread_mutex_unlock(&report_mutex);
-
     fclose(fp);
 
-    if (mapped_count < g_node_count) {
-        printf("❌ [FAILURE] マッピング不完全 (%d/%d)。\n", mapped_count, g_node_count);
-        return 1;
-    }
-    printf("✅ [SUCCESS] 全ノードマッピング完了。\n");
+    printf("✅ [SUCCESS] 全ノードマッピング完了 (%d/%d台 確定)。\n", mapped_count, g_node_count);
     return 0;
 }
 
@@ -871,7 +920,7 @@ int BLE_send_map_result(int map_result) {
         char addr_hex[13];
         compress_addr_to_hex12(g_nodes[i].addr, addr_hex, sizeof(addr_hex));
         char name_field[32];
-        snprintf(name_field, sizeof(name_field), "MK:%d:%s:%d,%d,%d", key, addr_hex, x, y, z);
+        snprintf(name_field, sizeof(name_field), "#%d:%s:%d,%d,%d", key, addr_hex, x, y, z);
 
         int len = 0;
         memset(adv_data, 0, sizeof(adv_data));

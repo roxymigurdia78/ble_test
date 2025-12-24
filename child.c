@@ -31,7 +31,7 @@
 #define CHILD_MAP_FILE_PATH "mapping.txt"
 
 // プロトコル時間定義
-#define P_MAG_TIME_SEC   30
+#define P_MAG_TIME_SEC   20
 #define P_SCAN_TIME_SEC  10
 #define C_MT_TIME_SEC    10
 #define C_ACT_TIME_SEC   20
@@ -72,7 +72,7 @@ static ChildMapEntry g_child_map[CHILD_MAX_MAP];
 #define SPI_SPEED   1000000
 #define NUM_CH      7
 
-#define DIFF_THRESHOLD        0.010
+#define DIFF_THRESHOLD        0.008
 #define STABLE_COUNT_REQUIRED 10
 #define BASELINE_SAMPLES      50
 
@@ -593,9 +593,9 @@ int BLE_scan_for_targets(const char *target_addr, int timeout_ms, int phase) {
             if (name[0] != '\0') {
                 if (phase == 1) {
                     const char *p = NULL;
-                    if (strncmp(name, "MK:", 3) == 0) p = name + 3;
-                    else if (strncmp(name, "MAPK:", 5) == 0) p = name + 5;
-
+        if (name[0] == '#') p = name + 1;       // 新しい短縮形式
+        else if (strncmp(name, "MK:", 3) == 0) p = name + 3; // 旧形式も一応残す
+        else if (strncmp(name, "MAPK:", 5) == 0) p = name + 5;
                     if (p) {
                         char *endp;
                         long key = strtol(p, &endp, 10);
@@ -989,7 +989,7 @@ int main(int argc, char *argv[]) {
     g_scan_phase = 1;
 
     while (!map_end_received) {
-        BLE_scan_for_targets(g_my_addr, 50, g_scan_phase);
+        BLE_scan_for_targets(g_my_addr, 2000, g_scan_phase);
         usleep(50000);
     }
 

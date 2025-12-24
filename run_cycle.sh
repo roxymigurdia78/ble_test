@@ -1,6 +1,6 @@
 #!/bin/bash
 # 作業ディレクトリに移動
-cd /home/lucy/ble_test || exit 1
+cd /home/kamayuri/ble_test || exit 1
 
 echo "=== System Loop Started ==="
 
