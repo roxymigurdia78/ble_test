@@ -37,7 +37,11 @@
 // 現在の曲ID
 int current_song_id = 0; 
 
-// 停止コマンドID
+// ★パケットタイプ定義
+#define PKT_TYPE_START     0x01 // 演奏開始
+#define PKT_TYPE_STOP      0xFF // 強制停止
+#define PKT_TYPE_CANDIDATE 0x10 // ★追加: 選挙の立候補パケット
+
 #define SONG_ID_STOP 0xFF
 
 #define PIN_SWITCH  17
@@ -45,8 +49,6 @@ int current_song_id = 0;
 #define PIN_LED_R   12
 #define PIN_LED_G   13
 #define PIN_LED_B   19
-
-// 終了用ボタン
 #define PIN_EXIT_BUTTON 16
 
 const int SENSORS[] = {14, 15, 18, 23};
@@ -58,10 +60,17 @@ const int SENSORS[] = {14, 15, 18, 23};
 #define ORIGIN_START_DELAY 1000 
 #define GRADATION_SPEED_MS 16666
 
-// --- 通信パケット定義 ---
+// ★選挙の期間 (ms)
+// 反応してからこの時間だけ、他の候補者と数値を比べ合う
+#define ELECTION_WINDOW_MS 300 
+
+// --- 通信パケット定義 (拡張) ---
 typedef struct __attribute__((packed)) {
     uint16_t company_id;
     uint16_t seq;
+    uint8_t  packet_type; // ★追加: パケットの種類
+    uint8_t  ticket;      // ★追加: 選挙用ランダム値 (0-255)
+    uint8_t  rank;        // ★追加: タイブレーカー用ランク
     uint8_t  song_id; 
     int8_t   origin_x; 
     int8_t   origin_y; 
@@ -93,15 +102,8 @@ void select_priority_for_song(int song_id) {
     } else if (song_id == 1) {
         CURRENT_PRIORITY = PART_PRIORITY_SONG1;
         CURRENT_PRIORITY_LEN = PRIORITY_LEN_SONG1;
-    } else if (song_id == 2) {
-        CURRENT_PRIORITY = PART_PRIORITY_SONG0;     
-        CURRENT_PRIORITY_LEN = 6;
-    } else if (song_id == 3) {
-        CURRENT_PRIORITY = PART_PRIORITY_SONG0;    
-        CURRENT_PRIORITY_LEN = 6;
     } else {
-        // 不正ID保険
-        CURRENT_PRIORITY = PART_PRIORITY_SONG0;
+        CURRENT_PRIORITY = PART_PRIORITY_SONG0;     
         CURRENT_PRIORITY_LEN = 6;
         current_song_id = 0;
     }
@@ -116,13 +118,14 @@ int my_x = 0, my_y = 0, my_z = 0;
 
 static volatile int is_playing = 0;
 static unsigned long last_trigger_time = 0;
-static char last_sender_mac[18] = {0};
-static int last_seq = -1;
+static int last_handled_seq = -1;
 
-static volatile int led_fadeout = 0;   // 0:点灯中 / 1:消灯フェーズ
-static unsigned long music_end_time = 0;
-
-
+// ★選挙ロジック用変数
+static int election_running = 0;        // 選挙中か？
+static unsigned long election_start_time = 0; // 選挙開始時刻
+static uint8_t my_ticket = 0;           // 自分のくじ引き番号
+static int pending_song_id = 0;         // 候補中の曲
+static int pending_trigger_pin = -1;    // 押されたピン
 
 // ---------------------------------------------------------------------------
 // 高精度タイマー & ユーティリティ
@@ -169,8 +172,6 @@ static void stop_playing(void) {
     pthread_mutex_unlock(&play_mtx);
 }
 
-
-
 static void try_set_realtime_priority() {
     struct sched_param p;
     p.sched_priority = 50; 
@@ -204,6 +205,7 @@ void set_led_color(int r, int g, int b) {
     if(g < 0) g = 0; if(g > 100) g = 100;
     if(b < 0) b = 0; if(b > 100) b = 100;
 
+    // 元のコードの設定を維持 (Active High / カソードコモン想定)
     softPwmWrite(PIN_LED_R, r);
     softPwmWrite(PIN_LED_G, g);
     softPwmWrite(PIN_LED_B, b);
@@ -241,41 +243,28 @@ void *led_thread_func(void *arg) {
         unsigned long now = get_time_ms();
         long elapsed = (long)(now - base_time);
 
-        // 音開始前は必ず消灯
         if (elapsed < 0) {
             set_led_color(0, 0, 0);
             sleep_ms(5);
             continue;
         }
 
-        // 現在の拍数
         int beat = elapsed / beat_ms;
         int max_hop = beat;
 
         if (hop <= max_hop) {
-            // 拍 × hop による色変化（旧ロジック）
-            float hue = fmodf((beat * 30.0f) - (hop * 30.0f), 360.0f);
-            if (hue < 0) hue += 360.0f;
-            
+            float hue = fmodf((beat * 30.0f) + (hop * 30.0f), 360.0f);
             int r, g, b;
             hsv_to_rgb(hue, 1.0f, 1.0f, &r, &g, &b);
             set_led_color(r, g, b);
         } else {
-            // 波がまだ到達していない
             set_led_color(0, 0, 0);
         }
-
         sleep_ms(10);
     }
-
-    // 再生終了時は消灯
     set_led_color(0, 0, 0);
     return NULL;
 }
-
-
-
-
 
 static void play_note_for_us(int freq, unsigned long usec) {
     if (freq > 0) {
@@ -288,15 +277,18 @@ static void play_note_for_us(int freq, unsigned long usec) {
 }
 
 // ---------------------------------------------------------------------------
-// BLE 送受信
+// BLE 送受信 (選挙用パケット対応)
 // ---------------------------------------------------------------------------
-void send_broadcast_packet(int seq, int song_id, int ox, int oy, int oz) {
+void send_packet(int seq, int type, int ticket, int song_id, int ox, int oy, int oz) {
     hci_le_set_advertise_enable(device_handle, 0, 1000);
     hci_le_set_scan_enable(device_handle, 0x00, 0x00, 1000);
 
     EffectPayload payload;
     payload.company_id = MY_COMPANY_ID;
     payload.seq = (uint16_t)seq;
+    payload.packet_type = (uint8_t)type; // ★種類
+    payload.ticket = (uint8_t)ticket;    // ★くじ引き番号
+    payload.rank = (uint8_t)my_rank;     // ★ランク(同じ番号だった時の判定用)
     payload.song_id = (uint8_t)song_id; 
     payload.origin_x = (int8_t)ox;
     payload.origin_y = (int8_t)oy;
@@ -334,12 +326,10 @@ void send_broadcast_packet(int seq, int song_id, int ox, int oy, int oz) {
     rq.rparam = NULL; rq.rlen = 0; rq.event = EVT_CMD_COMPLETE;
     hci_send_req(device_handle, &rq, 1000);
 
-    // 送信
     hci_le_set_advertise_enable(device_handle, 1, 1000);
-    sleep_ms(150);
+    sleep_ms(100); 
     hci_le_set_advertise_enable(device_handle, 0, 1000);
     
-    // スキャン再開
     hci_le_set_scan_parameters(device_handle, 0x01, 0x40, 0x40, 0x00, 0x00, 1000);
     hci_le_set_scan_enable(device_handle, 0x01, 0x00, 1000);
 }
@@ -370,11 +360,13 @@ void *scheduled_play_thread(void *arg) {
     if (is_playing) return NULL;
     if (!try_start_playing()) return NULL;
 
-    int max_parts = get_part_count(current_song_id);
-    if (max_parts <= 0) max_parts = 1;   // 念のための保険
+    int max_parts = 1;
+    // Note: music_data.hの実装に合わせて調整してください
+    // ここでは簡易的に2曲決め打ち
+    if (current_song_id == 0) max_parts = 6;
+    else if (current_song_id == 1) max_parts = 7;
 
     int dynamic_part_id = 1;
-
     if (CURRENT_PRIORITY && CURRENT_PRIORITY_LEN > 0) {
         dynamic_part_id = CURRENT_PRIORITY[ my_rank % CURRENT_PRIORITY_LEN ];
     }
@@ -396,12 +388,12 @@ void *scheduled_play_thread(void *arg) {
 
     int i = 0;
     const int GAP_US = 10000;
-    while (score[i].freq != -1 && is_playing) { // is_playingチェック追加
+    while (score[i].freq != -1 && is_playing) {
         unsigned long total_duration_us = (unsigned long)(score[i].duration_ms * 1000.0f);
         if (score[i].freq > 0) {
-            unsigned long play_us = (total_duration_us > GAP_US) ? (total_duration_us - GAP_US) : total_duration_us;
+            unsigned long play_us = (total_duration_us > 10000) ? (total_duration_us - 10000) : total_duration_us;
             play_note_for_us((int)score[i].freq, play_us);
-            if (play_us < total_duration_us) sleep_us(GAP_US);
+            if (play_us < total_duration_us) sleep_us(10000);
         } else {
             sleep_us(total_duration_us);
         }
@@ -410,7 +402,6 @@ void *scheduled_play_thread(void *arg) {
     softToneWrite(PIN_SPK, 0);
     sleep_ms(500);
     stop_playing();
-    // 音楽スレッド終了時に念のため消灯
     set_led_color(0,0,0);
     return NULL;
 }
@@ -433,13 +424,8 @@ int compare_nodes(const void *a, const void *b) {
 
 void determine_role_from_map() {
     select_priority_for_song(current_song_id);
-
     FILE *fp = fopen(MAP_FILE, "r");
-    if (!fp) { 
-        printf("[WARN] Map file %s not found. Using default.\n", MAP_FILE);
-        my_part_id = 1; 
-        return; 
-    }
+    if (!fp) { my_part_id = 1; return; }
     NodeInfo nodes[100];
     int count = 0;
     char line[256];
@@ -461,27 +447,20 @@ void determine_role_from_map() {
         if (strcasecmp(nodes[i].mac, my_mac_addr) == 0) { my_rank = i; break; }
     }
     if (my_rank == -1) { my_part_id = 1; my_rank = 0; return; }
-    
     printf("[INIT] I am Key:%d at (%d, %d, %d).\n", nodes[my_rank].key, my_x, my_y, my_z);
 }
 
-// ---------------------------------------------------------------------------
-// 終了処理 (Ctrl+C対応版)
-// ---------------------------------------------------------------------------
 void cleanup_and_exit(int sig) {
     printf("\n[SYSTEM] Shutting down...\n");
     stop_playing();
-    // ★★★ 重要: PWM消灯 + 待機 + 強制LOW ★★★
-    // 1. まずPWMで消灯命令
+    
+    // ★LED終了処理: 元のコードに合わせて 0 (消灯)
     softPwmWrite(PIN_LED_R, 0); 
     softPwmWrite(PIN_LED_G, 0); 
     softPwmWrite(PIN_LED_B, 0);
-    
-    // 2. 命令が反映されるまで少し待つ (50ms)
-    // これがないと、PWMサイクルがONの瞬間にプロセスが死んでHigh固定になる
     usleep(50000); 
-
-    // 3. 念には念を入れ、ピンを出力モードにしてLOWを叩き込む
+    
+    // Low(0) = 消灯
     pinMode(PIN_LED_R, OUTPUT); digitalWrite(PIN_LED_R, 0);
     pinMode(PIN_LED_G, OUTPUT); digitalWrite(PIN_LED_G, 0);
     pinMode(PIN_LED_B, OUTPUT); digitalWrite(PIN_LED_B, 0);
@@ -495,8 +474,7 @@ void cleanup_and_exit(int sig) {
 // メインループ
 // ---------------------------------------------------------------------------
 int main() {
-    printf("=== Effect Main (LED Shutdown Fix) ===\n");
-    printf("Press GPIO %d (Button) to Broadcast STOP and Exit.\n", PIN_EXIT_BUTTON);
+    printf("=== Effect Main (Election + Original LED Logic) ===\n");
     signal(SIGINT, cleanup_and_exit);
     srand(time(NULL)); 
 
@@ -508,12 +486,19 @@ int main() {
 
     for (int i=0; i<NUM_SENSORS; i++) { pinMode(SENSORS[i], INPUT); pullUpDnControl(SENSORS[i], PUD_DOWN); }
     
-    // 初期化 (0=消灯)
+    // ★初期化: 0 (消灯)
     softPwmCreate(PIN_LED_R, 0, 100); 
     softPwmCreate(PIN_LED_G, 0, 100); 
     softPwmCreate(PIN_LED_B, 0, 100);
-    
     softToneCreate(PIN_SPK);
+
+    // 起動デモ
+    printf("Startup Demo...\n");
+    set_led_color(100, 0, 0); sleep_ms(300); 
+    set_led_color(0, 100, 0); sleep_ms(300); 
+    set_led_color(0, 0, 100); sleep_ms(300); 
+    set_led_color(50, 50, 50); sleep_ms(500); 
+    set_led_color(0, 0, 0);   sleep_ms(200); 
 
     system("sudo hciconfig hci0 down"); system("sudo hciconfig hci0 up");
     device_handle = hci_open_dev(HCI_DEV_ID);
@@ -534,59 +519,75 @@ int main() {
     printf("System Ready.\n");
 
     while (1) {
-        // --- 終了ボタン (ブロードキャストしてから終了) ---
+        // --- ボタン処理 ---
         if (digitalRead(PIN_EXIT_BUTTON) == 0) {
              usleep(20000);
              if (digitalRead(PIN_EXIT_BUTTON) == 0) {
-                 printf("\n[EXIT BUTTON] Initiating Global STOP...\n");
+                 printf("\n[EXIT BUTTON] Global STOP\n");
                  for(int k=0; k<5; k++) {
-                     send_broadcast_packet(0, SONG_ID_STOP, my_x, my_y, my_z);
+                     send_packet(0, PKT_TYPE_STOP, 0, 0, 0, 0, 0);
                      usleep(50000);
                  }
                  cleanup_and_exit(0);
              }
         }
 
-        int is_triggered = 0;
+        // --- センサ処理 ---
+        int sensor_hit = 0;
         int trigger_pin = -1;
 
         if (get_time_ms() - last_trigger_time > 3000) {
             for (int i=0; i<NUM_SENSORS; i++) {
-                if (digitalRead(SENSORS[i]) == HIGH) { is_triggered = 1; trigger_pin = SENSORS[i]; break; }
+                if (digitalRead(SENSORS[i]) == HIGH) { 
+                    sensor_hit = 1; trigger_pin = SENSORS[i]; break; 
+                }
             }
         }
-        if (kbhit()) { getchar(); is_triggered = 1; trigger_pin = 999; }
+        if (kbhit()) { getchar(); sensor_hit = 1; trigger_pin = 999; }
 
-        if (is_triggered) {
-            if (is_playing) { sleep_ms(100); continue; }
-            sleep_ms(my_rank * 5);
-
-            static uint8_t local_seq = 0;
-            uint16_t global_seq = ((my_rank & 0xFF) << 8) | (++local_seq);
-            last_trigger_time = get_time_ms();
-            int chosen_song = rand() % SONG_COUNT;
-            select_priority_for_song(chosen_song);
-
-            printf("\n[TRIGGER] Origin! Song:%d Coords:(%d, %d, %d) Seq:%d\n", chosen_song, my_x, my_y, my_z, global_seq);
-            unsigned long my_target = get_time_ms() + ORIGIN_START_DELAY;
-
-            // Trigger送信
-            send_broadcast_packet(global_seq, chosen_song, my_x, my_y, my_z);
-
-            ScheduleArgs *sch = malloc(sizeof(ScheduleArgs));
-            sch->target_time = my_target; 
-            sch->seq = global_seq; 
-            sch->dist = 0;
-            sch->ox = my_x; sch->oy = my_y; sch->oz = my_z;
-            pthread_t th_play; pthread_create(&th_play, NULL, scheduled_play_thread, sch);
-            pthread_detach(th_play);
-
-            if (trigger_pin != 999) {
-                int cnt=0; while (digitalRead(trigger_pin) == HIGH && cnt<50) { sleep_ms(100); cnt++; }
-                sleep_ms(2000);
+        // ★★★ 選挙への立候補 ★★★
+        if (sensor_hit) {
+            if (!is_playing && !election_running) {
+                election_running = 1;
+                election_start_time = get_time_ms();
+                my_ticket = rand() % 255; // 自分の強さ(乱数)
+                pending_song_id = rand() % 2;
+                pending_trigger_pin = trigger_pin;
+                
+                printf("Candidate! Ticket: %d\n", my_ticket);
+                send_packet(0, PKT_TYPE_CANDIDATE, my_ticket, pending_song_id, 0, 0, 0);
             }
         }
 
+        // ★★★ 選挙結果判定 ★★★
+        if (election_running) {
+            if (get_time_ms() - election_start_time >= ELECTION_WINDOW_MS) {
+                // 勝ち残り！ -> 自分がOriginとしてスタート
+                election_running = 0;
+                static uint8_t local_seq = 0;
+                uint16_t global_seq = ((my_rank & 0xFF) << 8) | (++local_seq);
+                last_trigger_time = get_time_ms();
+                
+                select_priority_for_song(pending_song_id);
+                printf("\n[WINNER] I am Origin! Ticket:%d\n", my_ticket);
+
+                unsigned long target = get_time_ms() + ORIGIN_START_DELAY;
+                
+                send_packet(global_seq, PKT_TYPE_START, 0, pending_song_id, my_x, my_y, my_z);
+
+                ScheduleArgs *sch = malloc(sizeof(ScheduleArgs));
+                sch->target_time = target; sch->seq = global_seq; sch->dist = 0;
+                sch->ox = my_x; sch->oy = my_y; sch->oz = my_z;
+                pthread_t th; pthread_create(&th, NULL, scheduled_play_thread, sch); pthread_detach(th);
+
+                if (pending_trigger_pin != 999 && pending_trigger_pin != -1) {
+                    int c=0; while(digitalRead(pending_trigger_pin)==HIGH && c<50) {sleep_ms(100);c++;}
+                    sleep_ms(2000);
+                }
+            }
+        }
+
+        // --- 受信処理 ---
         FD_ZERO(&rfds); FD_SET(device_handle, &rfds);
         tv.tv_sec = 0; tv.tv_usec = 10000;
         if (select(device_handle + 1, &rfds, NULL, NULL, &tv) > 0) {
@@ -604,55 +605,60 @@ int main() {
                         if (dlen == 0) break;
                         int type = info->data[offset+1];
 
-                        // AD Type 0xFF (Manufacturer Data) をチェック
                         if (type == 0xFF && dlen >= (int)sizeof(EffectPayload)) {
-                            EffectPayload *payload = (EffectPayload *)&info->data[offset+2];
-                            if (payload->company_id != MY_COMPANY_ID) { offset += dlen + 1; continue; }
+                            EffectPayload *p = (EffectPayload *)&info->data[offset+2];
+                            if (p->company_id != MY_COMPANY_ID) { offset += dlen + 1; continue; }
 
-                            if (payload->song_id == SONG_ID_STOP) {
-                                printf("\n[RECV] Received Global STOP Signal!\n");
-                                printf("Relaying STOP signal...\n");
+                            // STOP信号
+                            if (p->packet_type == PKT_TYPE_STOP) {
+                                printf("\n[RECV] STOP Signal!\n");
                                 for(int k=0; k<3; k++) {
-                                    send_broadcast_packet(0, SONG_ID_STOP, my_x, my_y, my_z);
+                                    send_packet(0, PKT_TYPE_STOP, 0, 0, 0, 0, 0);
                                     usleep(50000);
                                 }
                                 cleanup_and_exit(0);
                             }
 
-                            int seq = payload->seq;
-                            int rcv_song_id = payload->song_id;
-                            int ox = payload->origin_x; int oy = payload->origin_y; int oz = payload->origin_z;
-
-                            if (seq == last_seq && strcasecmp(sender_mac, last_sender_mac) == 0) {
+                            // ★★★ 選挙ロジック (他者の立候補を受信) ★★★
+                            if (p->packet_type == PKT_TYPE_CANDIDATE) {
+                                if (election_running) {
+                                    // 相手の方が強いチケットを持っている、または同じで相手のランクが高い(IDが小さい)場合
+                                    if (p->ticket > my_ticket || (p->ticket == my_ticket && p->rank < my_rank)) {
+                                        printf("Lost election to Ticket:%d (My:%d)\n", p->ticket, my_ticket);
+                                        election_running = 0; // 降りる
+                                    }
+                                }
                                 offset += dlen + 1;
                                 continue;
                             }
-                            strcpy(last_sender_mac, sender_mac);
-                            last_seq = seq;
 
-                            select_priority_for_song(rcv_song_id);
-                            int dist = abs(my_x - ox) + abs(my_y - oy) + abs(my_z - oz);
-                            int estimated_hop_delay = dist * 10; 
-                            int wait_time = ORIGIN_START_DELAY - estimated_hop_delay;
-                            if (wait_time < 0) wait_time = 0;
-                            unsigned long now = get_time_ms();
-                            unsigned long my_target = now + wait_time;
+                            // ★★★ スタート信号を受信 ★★★
+                            if (p->packet_type == PKT_TYPE_START) {
+                                // もし選挙中なら、誰かが勝利してスタートしたということなので降りる
+                                if (election_running) election_running = 0;
 
-                            printf("[RECV] Song:%d From:(%d,%d,%d) MyDist:%d -> Wait %d ms\n", rcv_song_id, ox, oy, oz, dist, wait_time);
+                                int seq = p->seq;
+                                if (seq == last_handled_seq) { offset += dlen + 1; continue; }
+                                last_handled_seq = seq;
 
-                            if (!is_playing) {
-                                printf("[RELAY] Relaying packet...\n");
-                                send_broadcast_packet(seq, rcv_song_id, ox, oy, oz);
-                            }
+                                select_priority_for_song(p->song_id);
+                                int dist = abs(my_x - p->origin_x) + abs(my_y - p->origin_y) + abs(my_z - p->origin_z);
+                                int est_hop = dist * 10;
+                                int wait = ORIGIN_START_DELAY - est_hop;
+                                if (wait < 0) wait = 0;
+                                unsigned long target = get_time_ms() + wait;
 
-                            if (!is_playing) {
-                                ScheduleArgs *sch = malloc(sizeof(ScheduleArgs));
-                                sch->target_time = my_target; 
-                                sch->seq = seq; 
-                                sch->dist = dist;
-                                sch->ox = ox; sch->oy = oy; sch->oz = oz;
-                                pthread_t th_play; pthread_create(&th_play, NULL, scheduled_play_thread, sch);
-                                pthread_detach(th_play);
+                                printf("[RECV] START Song:%d Dist:%d\n", p->song_id, dist);
+
+                                if (!is_playing) {
+                                    printf("[RELAY] Relaying START...\n");
+                                    send_packet(seq, PKT_TYPE_START, 0, p->song_id, p->origin_x, p->origin_y, p->origin_z);
+                                    
+                                    ScheduleArgs *sch = malloc(sizeof(ScheduleArgs));
+                                    sch->target_time = target; sch->seq = seq; sch->dist = dist;
+                                    sch->ox = p->origin_x; sch->oy = p->origin_y; sch->oz = p->origin_z;
+                                    pthread_t th; pthread_create(&th, NULL, scheduled_play_thread, sch); pthread_detach(th);
+                                }
                             }
                         }
                         offset += dlen + 1;
